@@ -39,7 +39,7 @@ We will use an existing tokenizer rather than build one. Dictionary matches are
 candidates, not automatic identification of the correct meaning in a sentence.
 Even a unique dictionary entry may contain several senses.
 
-Korean, JESC, audio, user accounts, translation models and automatic grammar
+JESC, audio, user accounts, translation models and automatic grammar
 correction are outside the required scope. We will not assign sentence-level
 JLPT ratings. Individual kanji meanings and readings do not necessarily give
 the meaning or pronunciation of a whole word.
