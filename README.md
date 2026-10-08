@@ -1,435 +1,240 @@
-# Japanese-English Lexical & Parallel Sentence Data Pipeline
-### Medallion Architecture with PySpark
+# Japanese Vocabulary and Example Lookup
 
-[![CI Pipeline](https://github.com/alkval/project_07/actions/workflows/ci.yml/badge.svg)](https://github.com/alkval/project_07/actions)
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-[![Apache Spark](https://img.shields.io/badge/Apache%20Spark-3.5%2B-orange.svg)](https://spark.apache.org/)
-[![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11-blue.svg)](https://www.python.org/)
+DAT535 course project by Alexander Kvalvaag and Christopher Liebich Kolle.
 
----
+We are building a PySpark batch pipeline that combines Japanese example sentences,
+dictionary entries and kanji information. A simple web interface will let users
+look up a word, see its readings and possible definitions, and find example
+sentences with English translations. We may also add an Anki export using the
+same prepared data.
 
-## Executive Summary
+The main work is in the pipeline: modelling the sources, connecting them,
+checking data quality, testing the processing and publishing reproducible outputs.
+The interface is a small demonstration of the result.
 
-This project implements an end-to-end, batch-oriented data engineering pipeline designed under the **Medallion Architecture (Bronze &rarr; Silver &rarr; Gold)** using **Apache Spark (PySpark)**. The pipeline ingests, cleans, harmonizes, and enriches Japanese-English parallel texts and comprehensive lexicographical resources.
+## Current status
 
-By combining the **Tatoeba Project** parallel sentence corpus with foundational linguistic dictionaries (**JMdict** and **KANJIDIC2**), the pipeline performs morphological tokenization, deterministic vocabulary matching, and kanji character decomposition. Downstream, the platform serves curated analytical datasets and language-learning metrics (e.g., JLPT grading, lexical complexity scoring, and bilingual alignment).
+This project is in the setup and proof-of-concept stage. As of 8 October 2026:
 
-```mermaid
-flowchart LR
-    subgraph S["Data Sources"]
-        T["Tatoeba Corpus<br/>(Sentences, Links, Tags)"]
-        J["JMdict_e<br/>(Multilingual Lexicon XML)"]
-        K["KANJIDIC2<br/>(Kanji Metadata XML)"]
-        SC["Japanese-English Subtitle Corpus<br/><s>Excluded (Quality/Noise)</s>"]
-        style SC fill:#f8d7da,stroke:#f5c2c7,stroke-dasharray: 5 5,color:#842029
-    end
+- The repository has been cloned to the Spark VM.
+- The original source files have been downloaded outside the repository.
+- Download URLs, sizes, modification dates and checksums are recorded in a manifest.
+- SudachiPy has been tested on a Japanese sentence, and its dependencies are pinned.
+- Token-to-JMdict matching has not been tested yet.
+- The Silver and Gold processing, web interface, tests and project-specific GitHub
+  Actions workflows are not implemented yet.
 
-    subgraph B["Bronze Layer (Raw Storage & Lineage)"]
-        BR["Raw Data Lake / Object Store<br/>- Preserved unchanged<br/>- Ingestion Timestamp<br/>- File name & Source URL<br/>- File size & SHA-256 Checksum<br/>- Snapshot / Source Version"]
-    end
+The sections below describe the planned pipeline, not completed features.
 
-    subgraph SL["Silver Layer (Cleaned & Harmonized Parquet)"]
-        SL1["Tatoeba Cleaning & Link Validation"]
-        SL2["JMdict XML Parsing & Sense Restrictions"]
-        SL3["KANJIDIC2 XML Parsing & Kanji Records"]
-        SL4["Morphological Tokenization (SudachiPy / MeCab)"]
-        SL5["Vocabulary Matching (JMdict Candidates)"]
-        SL6["Kanji Extraction & KANJIDIC2 Matching"]
-        SL7["Quality Quarantining & Match Reporting"]
-    end
+## Scope
 
-    subgraph G["Gold Layer (Curated Data Marts)"]
-        G1["Sentence Difficulty & JLPT Readability Index"]
-        G2["Enriched Bilingual Alignment Corpus"]
-        G3["Lexical & Character Coverage KPI Mart"]
-    end
+The required version will support Japanese dictionary written forms and readings.
+It will combine:
 
-    T --> BR
-    J --> BR
-    K --> BR
-    BR --> SL1
-    BR --> SL2
-    BR --> SL3
-    SL1 --> SL4
-    SL4 --> SL5
-    SL2 --> SL5
-    SL5 --> SL6
-    SL3 --> SL6
-    SL6 --> SL7
-    SL7 --> G1
-    SL7 --> G2
-    SL7 --> G3
+- **Tatoeba:** Japanese sentences, English translations and sentence tags.
+- **JMdict:** written forms, readings, parts of speech and English definitions.
+- **KANJIDIC2:** meanings, readings and metadata for individual kanji characters.
+
+We will use an existing tokenizer rather than build one. Dictionary matches are
+candidates, not automatic identification of the correct meaning in a sentence.
+Even a unique dictionary entry may contain several senses.
+
+Korean, JESC, audio, user accounts, translation models and automatic grammar
+correction are outside the required scope. We will not assign sentence-level
+JLPT ratings. Individual kanji meanings and readings do not necessarily give
+the meaning or pronunciation of a whole word.
+
+## Sources
+
+| Source | Files used | Role |
+| --- | --- | --- |
+| Tatoeba | Japanese and English detailed sentences, Japanese–English links, and tags for both languages (`.tsv.bz2`) | Examples and translation relationships |
+| JMdict | Japanese–English dictionary (`JMdict_e.gz`, compressed XML) | Vocabulary entries and possible definitions |
+| KANJIDIC2 | `kanjidic2.xml.gz` | Character information |
+
+The initial download contains about 53 MB of compressed files. The five Tatoeba
+files total about 43 MB compressed, JMdict about 63 MB uncompressed, and
+KANJIDIC2 about 16 MB uncompressed. These are measurements of our downloaded
+files, not fixed dataset sizes.
+
+The Tatoeba snapshot dated 3 October 2026 contains 248,924 Japanese sentences,
+2,038,137 English sentences and 280,716 Japanese–English links. The English file
+contains all English sentences in that export, not just translations of Japanese.
+The dictionary files downloaded on 8 October have their own source dates.
+We will profile their entry counts during development.
+
+This data fits on one machine. We use Spark to implement partition-based
+processing, relational joins and quality summaries, and to measure relevant
+performance choices. We do not claim that this workload requires a cluster.
+
+## Planned pipeline
+
+### Bronze: preserve the downloads
+
+Bronze retains the original compressed files without changing their contents.
+A run manifest identifies the exact combination of source versions used and
+records URLs, retrieval times, source modification dates, file sizes and SHA-256
+checksums. The sources are published independently and need not share a date.
+
+We plan to check for updates weekly through GitHub Actions, after Tatoeba's
+Saturday export. Each export is a full snapshot, not an incremental batch to
+append to an existing sentence table. Unchanged content can be reused, while
+new versions remain separate. Detecting changes before downloading will depend
+on available HTTP metadata, with checksums verifying downloaded content.
+
+Failed downloads and corrupt archives must not replace a working published
+version. The initial one-off download is not yet the scheduled ingestion pipeline.
+
+### Silver: model, validate and connect the sources
+
+We plan to store validated tables as Parquet. Their keys will include a source
+snapshot or version identifier where needed to distinguish historical records.
+
+| Table or relationship | One row represents |
+| --- | --- |
+| Sentences | A sentence ID within a Tatoeba snapshot |
+| Translation links | A Japanese–English ID pair within a snapshot |
+| Sentence tags | A sentence–tag relationship |
+| Dictionary entries, forms, readings and senses | A dictionary entity or child record within a JMdict version |
+| Sentence tokens | A token position within a sentence and tokenizer version |
+| Token matches | A token–dictionary-entry candidate, including the matching rule |
+| Kanji records and readings/meanings | A character record or child record within a KANJIDIC2 version |
+| Word–kanji relationships | A distinct character occurring in a dictionary written form |
+
+Processing will include:
+
+1. Parse explicit schemas, cast IDs and dates, and convert Tatoeba's `\N` to null.
+2. Validate required fields and references. Quarantine malformed records and
+   broken links with their original values and a reason. Missing optional owners
+   or dates are reported, not automatically rejected.
+3. Preserve distinct translation alternatives. Aggregate tags before enriching
+   pairs so several tags do not accidentally multiply the examples.
+4. Parse JMdict reading and sense restrictions without creating invalid
+   combinations of written forms, readings and meanings.
+5. Tokenise each Japanese sentence once, retaining surface text, dictionary form,
+   reading, part of speech and token positions. Reuse tokenizer instances within
+   Spark partitions.
+6. Match dictionary forms to candidate JMdict entries. Reading information can
+   help where compatible, but a token's reading is not necessarily the reading of
+   its dictionary form. Any script normalisation or fallback rule will be explicit
+   and tested. Unmatched and ambiguous tokens are not automatically bad data.
+7. Connect characters in written forms to KANJIDIC2 and report unmatched kanji.
+
+Original text will remain available. If we add normalised text, token offsets
+will identify which text representation they refer to. Character handling will
+not assume that every kanji fits a narrow Unicode range.
+
+Quality reports will include input/output counts, broken references, missing
+metadata, translation coverage, candidate-match coverage and ambiguity. We will
+separate structural validation from linguistic uncertainty. Tatoeba warning tags
+are useful signals, but their presence or absence does not prove correctness.
+
+We will reconcile accepted, rejected and explicitly deduplicated records and
+check relationship keys. Snapshot comparisons will identify additions, changes
+and removals. A small manually reviewed sample will help assess matching
+usefulness without claiming to validate the whole corpus.
+
+### Gold: prepare lookup outputs
+
+Gold will package vocabulary, candidate definitions, translated examples and
+kanji information for the lookup interface. We plan to use SQLite as the serving
+database, so a user search does not start a Spark job.
+
+The interface will show a limited set of examples using stated selection rules,
+such as length limits and review-warning tags. A linked English translation is
+not a verified translation. Kanji details will be displayed separately from word
+definitions, and results will retain source references.
+
+A new serving version will only become ready after export and validation succeed.
+Failed runs will leave the previous version available. An optional Anki export
+could use the same Gold data, with one target word and selected example per card.
+
+## Testing and performance
+
+Planned fixtures cover missing endpoints, invalid dates, duplicate pairs,
+multiple tags and translations, inflected forms, dictionary restrictions and
+ambiguous matches. Tests will check schemas, keys, count reconciliation,
+matching rules, deterministic reruns and known lookup queries.
+
+We will use both DataFrame operations and Spark SQL. Performance comparisons
+will use the same inputs and record repeated runtimes, execution plans and
+shuffle metrics where available. Broadcast joins, caching and partition counts
+will be chosen based on measurements, not prescribed in advance. Coverage
+thresholds will be justified after profiling rather than assumed to be 99%.
+
+## Development and automation
+
+Development will use small fixed samples, with separate dev and prod output
+paths. Planned GitHub Actions workflows will run tests, support manual runs,
+and check for weekly updates. Code changes will be reviewed through pull
+requests, and production runs will use an environment approval gate. Logs,
+manifests, quality reports and serving outputs will be retained as artifacts.
+
+The runner previously registered to the lab repository does not automatically
+serve this repository. Project runner access and workflows still need setup.
+
+## Current VM setup
+
+```text
+/home/ubuntu/project_07/          Code, documentation and dependency pins
+/home/ubuntu/project-data/       Downloaded datasets and future processing outputs
 ```
 
----
+The initial Bronze download is at:
 
-## 1. Project Statement (Scope)
-
-### Problem & Analytical Motivation
-Japanese is an agglutinative language written without inter-word spacing across three distinct writing systems (Kanji, Hiragana, and Katakana). Parallel bilingual corpora (such as Tatoeba) provide abundant contextual usage examples, but raw sentence pairs lack morphological parsing, lexical definitions, and character difficulty metrics. Conversely, rich lexical databases such as JMdict and KANJIDIC2 exist in monolithic, highly nested XML formats that are computationally cumbersome to join against sentence corpora at scale.
-
-Existing open-source corpora are frequently fragmented, contain broken cross-reference links, or exhibit low fidelity (as observed in noisy subtitle corpora). Language learners, lexicographers, and NLP practitioners require a clean, structurally unified dataset where every sentence is deterministically tokenized, paired with its authoritative dictionary entry, and indexed by kanji difficulty.
-
-### Intended Outcome
-To build a scalable, reproducible PySpark pipeline that:
-1. Ingests and version-controls raw Japanese parallel text and lexicographical resources in an immutable **Bronze** layer.
-2. Normalizes, tokenizes, validates, and structurally relates sentences to dictionary definitions and kanji attributes in a typed, columnar **Silver** layer (stored as Parquet).
-3. Delivers high-performance **Gold** data marts supporting sentence-level readability scoring, vocabulary difficulty profiling (JLPT N5&ndash;N1), and parallel alignment analytics.
-
-### Target Consumers
-- **Educational Technology & Language Apps:** Downstream spaced-repetition platforms (e.g., Anki decks, reader applications) requiring graded parallel sentences.
-- **NLP Researchers & Corpus Linguists:** Teams training tokenizer/lemmatizer models or evaluating cross-lingual alignment.
-- **Data Analysts & BI Consumers:** Stakeholders monitoring corpus quality, kanji distribution, and vocabulary coverage.
-
-### Out of Scope
-- **Real-Time Streaming:** The pipeline processes batch snapshots; real-time streaming ingestion (e.g., Kafka/Spark Structured Streaming) is excluded from the initial scope.
-- **Heuristic / Probabilistic Sense Guessing:** If a token matches multiple homographs in JMdict without sufficient grammatical constraints, the pipeline flags it as `AMBIGUOUS_MATCH` rather than guessing a specific sense.
-- **Corpus Evaluation of Low-Fidelity Sources:** The Japanese-English Subtitle Corpus was evaluated during preliminary research and explicitly excluded due to unacceptable noise and misalignment rates (detailed in Section 2).
-
----
-
-## 2. Dataset (Source and Suitability)
-
-### Primary Data Sources
-
-| Source | Format | Ingestion Volume / Pattern | Description & Role |
-| :--- | :--- | :--- | :--- |
-| **Tatoeba Project** | TSV / CSV (`tar.bz2`) | Weekly / Monthly Batch (~400MB compressed, ~2M+ sentences) | Crowdsourced bilingual sentence pairs, translation cross-links (`links.csv`), and user-annotated tags (`tags.csv`). |
-| **JMdict_e** | XML (`.gz`) | Bi-weekly / Monthly Batch (~75MB uncompressed XML) | Electronic Japanese-English dictionary maintained by EDRDG (Jim Breen). Contains ~190,000 entries with kanji variants, kana readings, POS tags, and sense restrictions. |
-| **KANJIDIC2** | XML (`.gz`) | Monthly Batch (~8MB XML) | Comprehensive kanji database containing 13,000+ characters with Joyo grade, JLPT rating, stroke count, frequency rank, and English meanings. |
-| ~~**Japanese-English Subtitle Corpus**~~ | Text / SubRip | *Excluded from Pipeline* | **Excluded:** Evaluated during preliminary analysis. Subtitle corpora exhibited severe timing drift, OCR/ASR artifacts, extreme colloquial contractions, and loose translations that created prohibitive noise in automated vocabulary alignment. |
-
-### Distributed Processing Suitability
-- **Volume & Structural Complexity:** Parsing millions of parallel sentences combined with high-cardinality nested XML dictionaries requires distributed memory processing. Spark decomposes the sentence corpus across partitions, allowing parallelized tokenization and distributed relational joins.
-- **Columnar Efficiency:** Transitioning from deeply nested XML and unindexed TSVs into compressed columnar Parquet yields an order-of-magnitude reduction in disk footprint and scan latency.
-
-### Source Limitations & Quality Risks
-- **One-to-Many Translation Fan-out:** A single Japanese sentence may link to multiple English translations, some of varying quality or grammatical tense.
-- **Nested Reading & Sense Restrictions in JMdict:** Certain readings (`<reb>`) only apply to specific kanji headwords (`<keb>`), and senses (`<sense>`) may be restricted to subset readings (`<re_restr>`). Flattening without preserving restrictions leads to invalid cross-products.
-- **Orphan Records & Incomplete IDs:** Sentence IDs referenced in `links.csv` may not exist in `sentences.csv`.
-- **Character Encoding & Normalization:** Mixed full-width/half-width alphanumeric characters, variations in Japanese punctuation, and historical kanji variants.
-
-### Licensing & Reproducibility
-- **Tatoeba:** Creative Commons Attribution 2.0 France (CC-BY 2.0 FR).
-- **JMdict & KANJIDIC2:** Creative Commons Attribution-ShareAlike 3.0 / 4.0 International (EDRDG).
-- **Codebase License:** GNU General Public License v3.0 (GPL-3.0).
-- **Reproducibility:** Source URLs, checksums, and version tags are archived in Bronze metadata catalogs to enable deterministic rebuilds.
-
----
-
-## 3. Bronze Layer (Ingest and Preserve)
-
-### Ingestion Strategy
-The Bronze layer acts as an append-only, immutable landing zone. Source artifacts are ingested directly via scheduled batch jobs from upstream mirrors, unpacked without mutation, and registered with operational metadata.
-
-```
-data/bronze/
-├── _metadata/
-│   └── ingestion_log.parquet
+```text
+/home/ubuntu/project-data/bronze/2026-10-08/20261008T091537Z-a582484d/
+├── manifest.json
 ├── tatoeba/
-│   └── snapshot_date=2026-10-01/
-│       ├── sentences.tsv
-│       ├── links.tsv
-│       └── tags.tsv
-├── jmdict/
-│   └── snapshot_date=2026-10-01/
-│       └── JMdict_e.xml
-└── kanjidic2/
-    └── snapshot_date=2026-10-01/
-        └── kanjidic2.xml
+│   ├── jpn_sentences_detailed.tsv.bz2
+│   ├── eng_sentences_detailed.tsv.bz2
+│   ├── jpn-eng_links.tsv.bz2
+│   ├── jpn_tags.tsv.bz2
+│   └── eng_tags.tsv.bz2
+├── jmdict/JMdict_e.gz
+└── kanjidic2/kanjidic2.xml.gz
 ```
 
-### Bronze Metadata Schema
-Every ingested file is paired with an entry in the Bronze Metadata Manifest:
+Full downloads and generated databases do not belong in Git. Small test fixtures
+will be stored in the repository. The data root will be configurable as the
+pipeline is implemented.
 
-| Attribute | Type | Description |
-| :--- | :--- | :--- |
-| `source_name` | `STRING` | Identifier (`tatoeba`, `jmdict`, `kanjidic2`) |
-| `file_name` | `STRING` | Original raw archive filename |
-| `source_url` | `STRING` | Fully qualified upstream download URL |
-| `download_timestamp` | `TIMESTAMP` | UTC timestamp of retrieval |
-| `size_bytes` | `BIGINT` | File size on storage |
-| `sha256_checksum` | `STRING` | Hex-encoded SHA-256 hash verifying raw integrity |
-| `snapshot_date` | `DATE` | Logical extraction snapshot date partition key |
-| `ingestion_run_id` | `STRING` | UUID representing the execution run |
-
-### Traceability, Idempotency & Late Data
-- **Idempotency:** Re-running an ingestion job for an existing `snapshot_date` validates the SHA-256 hash. If unchanged, the job skips download to prevent duplication. If the upstream hash differs, a new revision partition is appended.
-- **Preservation:** No text stripping, tokenization, or column renaming occurs in Bronze. Raw files remain 100% bit-exact representations of upstream releases.
-
----
-
-## 4. Silver Layer (Primary Focus)
-
-The Silver layer enforces schema validation, relational normalization, morphological parsing, entity matching, and data quality quarantining.
-
-### Step-by-Step Silver Pipeline
-
-```mermaid
-flowchart TD
-    subgraph S1["1. Parsing & Normalization"]
-        B_T["Bronze Tatoeba"] --> P_T["Parse Sentences, Links & Tags<br/>Filter ja/eng, Normalize Unicode (NFKC)"]
-        B_J["Bronze JMdict XML"] --> P_J["Parse Entries, Forms, Readings & Senses<br/>Preserve re_restr & stagk Restrictions"]
-        B_K["Bronze KANJIDIC2 XML"] --> P_K["Parse Character Nodes, Meanings,<br/>Readings, JLPT & Stroke Counts"]
-    end
-
-    subgraph S2["2. Validation & Quarantine"]
-        P_T --> V_T{"Validate IDs & Links"}
-        V_T -- Invalid / Orphan --> Q_T["Quarantine: Broken Records"]
-        V_T -- Valid --> C_T["Clean Bilingual Pairs"]
-    end
-
-    subgraph S3["3. Tokenisation"]
-        C_T --> TOK["Distributed Tokenizer (SudachiPy / MeCab)<br/>- Extract Surface Words & Lemmatized Base Forms<br/>- Extract Readings & POS Tags<br/>- Record Token Offsets & Sentence Positions"]
-    end
-
-    subgraph S4["4. Vocabulary Matching"]
-        TOK --> VM{"Match Tokens to JMdict"}
-        P_J --> VM
-        VM -- Exact Match --> VM_OK["Matched Vocabulary Tokens"]
-        VM -- Multi-Entry Match --> VM_AMB["Flag: AMBIGUOUS_MATCH"]
-        VM -- No Entry Found --> VM_UN["Flag: UNMATCHED"]
-    end
-
-    subgraph S5["5. Kanji Matching"]
-        VM_OK & VM_AMB & VM_UN --> KM["Extract Unique Kanji Characters"]
-        P_K --> KM
-        KM --> KM_OK["Annotated Kanji Elements<br/>(JLPT, Grade, Strokes, Meanings)"]
-    end
-
-    subgraph S6["6. Storage & Quality Reporting"]
-        KM_OK --> PARQ[("Silver Parquet Tables")]
-        PARQ --> QR["Quality Metric Report<br/>- Validation failure rate<br/>- Dictionary-match coverage<br/>- Ambiguity proportion<br/>- Kanji coverage rate"]
-    end
-```
-
-### 1. Data Understanding & Grain Definition
-
-| Entity / Table | Core Grain | Essential Attributes | Derived / Enriched Attributes |
-| :--- | :--- | :--- | :--- |
-| `silver_sentences` | 1 record per sentence | `sentence_id`, `lang`, `text` | Character count, script composition flags (has_kanji, has_kana) |
-| `silver_sentence_links` | 1 record per verified bilingual pair | `jp_sentence_id`, `en_sentence_id` | Translation rank/alternative index |
-| `silver_sentence_tokens` | 1 record per token occurrence in sentence | `sentence_id`, `token_idx`, `surface_form`, `base_form`, `pos` | Token reading, start/end char offsets |
-| `silver_jmdict_entries` | 1 record per sense definition | `entry_id`, `sense_idx`, `pos`, `glossary` | Applicable kanji heads, applicable kana readings |
-| `silver_token_vocabulary_matches` | 1 record per token-to-lexicon join candidate | `sentence_id`, `token_idx`, `match_status`, `entry_id` | Match confidence score, candidate match count |
-| `silver_kanjidic_characters` | 1 record per kanji character | `literal`, `grade`, `stroke_count`, `jlpt_level` | Primary on/kun readings, English meanings |
-| `silver_sentence_kanji` | 1 record per distinct kanji per sentence | `sentence_id`, `literal`, `frequency_in_sentence` | Character JLPT level, stroke count |
-
-### 2. Cleaning & Standardization Rules
-- **Unicode Normalization:** All Japanese text is normalized via Unicode NFKC to unify full-width ASCII characters, half-width katakana, and ideographic spaces.
-- **Link Integrity & Quarantining:** Referential integrity checks confirm that both `jp_sentence_id` and `en_sentence_id` exist in `sentences`. Dangling links and malformed IDs are written to `silver_quarantine_links` for audit.
-- **Dictionary Restriction Preservation:** JMdict XML `<re_restr>` (reading restriction) and `<stagk>`/`<stagr>` (sense restriction) tags are extracted as relational arrays rather than flat cartesians to prevent cross-contamination of homophonic words.
-
-### 3. Morphological Tokenization & PySpark Implementation
-- Tokenization requires executing a morphological analyzer (e.g., `SudachiPy` with split mode `C` or `fugashi` / `MeCab`) over distributed partitions.
-- **Spark Implementation:** To avoid Python serialization bottlenecks, the tokenizer instance is initialized once per Spark partition via `mapPartitions` or implemented as a vectorized Pandas UDF (`pyspark.sql.functions.pandas_udf`).
-- **Extracted Token Schema:**
-  ```python
-  StructType([
-      StructField("sentence_id", IntegerType(), False),
-      StructField("token_idx", ShortType(), False),
-      StructField("surface_form", StringType(), False),
-      StructField("base_form", StringType(), False),
-      StructField("reading", StringType(), True),
-      StructField("pos_major", StringType(), False),
-      StructField("pos_minor", StringType(), True),
-      StructField("start_offset", ShortType(), False),
-      StructField("end_offset", ShortType(), False)
-  ])
-  ```
-
-### 4. Deterministic Vocabulary & Kanji Matching
-- **Vocabulary Matching:** Tokens are joined against `silver_jmdict_entries` using compound join keys `(base_form, reading)`.
-  - When exact matching succeeds uniquely &rarr; `status = 'EXACT_MATCH'`.
-  - When matching maps to $>1$ distinct entry IDs &rarr; `status = 'AMBIGUOUS_MATCH'` with candidate list preserved in an array.
-  - When base form cannot be mapped &rarr; `status = 'UNMATCHED'`.
-  - *No synthetic sense assignment or hallucinated defaults are permitted.*
-- **Kanji Character Decomposition:** Japanese tokens are split into individual codepoints filtered by the CJK Unified Ideographs block (`U+4E00`&ndash;`U+9FAF`). Distinct characters are joined to `silver_kanjidic_characters`.
-
-### 5. Quality Metrics & Evidence
-The Silver layer generates automated quality verification metrics before outputting to Parquet:
-- **Link Validity Rate:** $\frac{\text{Valid Bilingual Links}}{\text{Raw Link Rows}} \ge 99.5\%$
-- **Tokenization Success Rate:** Percentage of Japanese sentences tokenized without runtime exceptions ($= 100\%$).
-- **Dictionary Coverage:** Percentage of content-word tokens (nouns, verbs, adjectives) successfully mapped to JMdict entries.
-- **Ambiguity Ratio:** Ratio of ambiguous candidate matches flagged for downstream analysis.
-- **Kanji Match Coverage:** Percentage of distinct kanji present in sentences matched to KANJIDIC2 records ($> 99.0\%$).
-
-### 6. Spark Performance Tuning & Evidence-Based Optimizations
-- **Broadcast Joins:** `silver_kanjidic_characters` (~13,000 rows, ~5MB) is broadcast via `broadcast(kanjidic_df)` during joins with sentence tokens, eliminating shuffle stages.
-- **Salted Joins for Common Particles:** High-frequency functional particles (e.g., の, は, を, に) create potential data skew during joins. The pipeline filters out closed-class grammatical particles from deep lexicon lookups or salts join keys where appropriate.
-- **Partitioning Strategy:** Silver Parquet tables are partitioned by `snapshot_date` and bucketed by `sentence_id` (`bucketBy(32, "sentence_id")`) to optimize downstream joins between tokens and parallel translations.
-
----
-
-## 5. Gold Layer (Serve the Outcome)
-
-The Gold layer aggregates and formats Silver data into specialized data marts tailored for direct consumption by BI dashboards, language learning tools, and linguistic applications.
-
-```
-data/gold/
-├── sentence_readability_metrics/   # Mart 1: Difficulty & JLPT scoring
-├── lexical_alignment_corpus/       # Mart 2: Enriched parallel sentences
-└── pipeline_quality_kpis/          # Mart 3: Operational quality metrics
-```
-
-### Gold Data Marts
-
-#### Mart 1: Sentence Readability & JLPT Index (`gold_sentence_readability_metrics`)
-- **Consumer Need:** Allows language-learning applications to filter and serve sentence examples matched to a learner's exact JLPT level (N5 through N1).
-- **Structure:**
-  - `sentence_id`
-  - `jp_text`, `en_text`
-  - `token_count`, `kanji_count`
-  - `max_kanji_grade` (Primary school 1&ndash;6, Secondary, Jinmeiyo)
-  - `sentence_jlpt_level` (Evaluated via worst-case or median token/kanji JLPT rating: N5, N4, N3, N2, N1)
-  - `rare_vocab_ratio` (Proportion of non-standard or unindexed vocabulary)
-
-#### Mart 2: Enriched Bilingual Lexical Corpus (`gold_lexical_alignment_corpus`)
-- **Consumer Need:** Export-ready corpus for digital readers, interactive dictionary popups, and parallel NLP corpus evaluation.
-- **Structure:** High-level hierarchical records containing the Japanese sentence, verified English translation, an array of token glosses with grammatical POS tags, and associated kanji breakdown cards.
-
-#### Mart 3: Pipeline Quality & Coverage Dashboard (`gold_pipeline_quality_kpis`)
-- **Consumer Need:** Operational data mart monitoring pipeline runs across snapshots.
-- **Measures:** Ingested count, quarantined count, lexicon coverage rate, average kanji complexity per sentence, and token ambiguity rate.
-
-### Downstream Readiness & Publishing
-Gold tables are written using atomic directory swaps (or Delta Lake `overwrite` partitions). Downstream applications consume Gold tables only after all automated schema tests and data quality thresholds pass.
-
----
-
-## 6. End-to-End Delivery & Operations
-
-### Reproducibility & Environment Separation
-The pipeline supports isolated configuration profiles across development, testing, and production environments:
-- **Local Dev / Testing:** Executes against subset fixtures with local PySpark master (`local[*]`).
-- **Production / Batch Cluster:** Points to distributed object storage / HDFS cluster with tuned Spark executor memory and core configurations.
-
-Environment settings are controlled via configuration files and environment variables:
-```bash
-# Environment configurations
-export ENV="dev"                   # Options: dev, staging, prod
-export SPARK_MASTER="local[*]"
-export DATA_BASE_DIR="./data"
-```
-
-### CI/CD Workflow (GitHub Actions)
-Every pull request and merge to `main` triggers automated validation:
-1. **Linting & Code Quality:** `flake8`, `black`, and `mypy` static type checking.
-2. **Unit & Pipeline Tests:** `pytest` validating XML parsing logic, quarantine routing, and tokenizer boundary conditions using small synthetic datasets.
-3. **End-to-End Integration Smoke Test:** Executes Bronze &rarr; Silver &rarr; Gold stages on a mini-corpus fixture, asserting schema stability and expected output row counts.
-
-### Repository Structure
-```
-project_07/
-├── .github/
-│   └── workflows/
-│       ├── ci.yml                 # Automated linting and pytest pipeline
-│       └── scheduled_ingest.yml   # Scheduled batch trigger
-├── config/
-│   ├── base_config.yaml           # Core schemas, thresholds, URLs
-│   ├── dev.yaml                   # Development environment overrides
-│   └── prod.yaml                  # Production environment settings
-├── data/                          # Data directory (managed by pipeline)
-│   ├── bronze/                    # Immutable raw files & metadata
-│   ├── silver/                    # Cleaned Parquet & quarantine logs
-│   └── gold/                      # Analytical data marts
-├── docs/
-│   ├── Assignment.pdf             # University course assignment guide
-│   └── architecture_diagram.png   # Architectural schematic
-├── src/
-│   ├── __init__.py
-│   ├── common/                    # Shared utilities, spark session, logging
-│   │   ├── spark_utils.py
-│   │   └── quality_metrics.py
-│   ├── bronze/                    # Bronze ingestion & hashing modules
-│   │   ├── ingest_tatoeba.py
-│   │   ├── ingest_jmdict.py
-│   │   └── ingest_kanjidic.py
-│   ├── silver/                    # Silver parsing, tokenization & joins
-│   │   ├── parse_tatoeba.py
-│   │   ├── parse_jmdict.py
-│   │   ├── parse_kanjidic.py
-│   │   ├── tokenize_sentences.py
-│   │   ├── match_vocabulary.py
-│   │   └── match_kanji.py
-│   └── gold/                      # Gold aggregations & mart generation
-│       ├── readability_mart.py
-│       └── alignment_corpus_mart.py
-├── tests/
-│   ├── fixtures/                  # Minimal XML and TSV fixtures
-│   ├── test_bronze_ingestion.py
-│   ├── test_silver_parsing.py
-│   ├── test_tokenization.py
-│   └── test_gold_marts.py
-├── .gitignore
-├── LICENSE                        # GNU General Public License v3
-├── README.md                      # Project documentation and specifications
-└── requirements.txt               # Python dependencies
-```
-
----
-
-## 7. Getting Started
-
-### Prerequisites
-- **Python:** 3.10 or 3.11
-- **Java JDK:** OpenJDK 17 or 11 (required for PySpark)
-- **Git**
-
-### Installation
-
-1. **Clone the repository:**
-   ```bash
-   git clone https://github.com/alkval/project_07.git
-   cd project_07
-   ```
-
-2. **Create and activate a virtual environment:**
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate
-   ```
-
-3. **Install dependencies:**
-   ```bash
-   pip install --upgrade pip
-   pip install -r requirements.txt
-   ```
-
-### Running the Pipeline
-
-Execute the pipeline stages sequentially:
+Clone the repository with:
 
 ```bash
-# 1. Ingest raw datasets to Bronze
-python -m src.bronze.ingest_tatoeba --env dev
-python -m src.bronze.ingest_jmdict --env dev
-python -m src.bronze.ingest_kanjidic --env dev
-
-# 2. Process and enrich Silver layer
-python -m src.silver.parse_tatoeba --env dev
-python -m src.silver.parse_jmdict --env dev
-python -m src.silver.parse_kanjidic --env dev
-python -m src.silver.tokenize_sentences --env dev
-python -m src.silver.match_vocabulary --env dev
-python -m src.silver.match_kanji --env dev
-
-# 3. Build Gold analytical marts
-python -m src.gold.readability_mart --env dev
-python -m src.gold.alignment_corpus_mart --env dev
+git clone https://github.com/dat535-group07-2026/project_07.git
+cd project_07
 ```
 
-### Running Test Suite
-Execute unit and schema validation tests:
+On the existing Spark VM, activate the lab environment with:
+
 ```bash
-pytest tests/ -v
+source /home/ubuntu/spark-env/bin/activate
+python -m pip install -r requirements.txt
 ```
 
----
+The tested tokenizer versions are `SudachiPy==0.6.11` and
+`SudachiDict-core==20260723`. Python is 3.11.15. The environment currently reports
+PySpark 4.2.0, but compatibility with the VM's Java and Spark runtime still needs
+verification. The dependency file currently covers only the tokenizer setup,
+not a complete pipeline installation.
 
-## 8. Data Licensing & Attributions
+There is no full-pipeline command yet. The next step is a small token-to-JMdict
+matching experiment before implementing the Silver tables.
 
-This project utilizes open linguistic datasets provided under permissive licenses:
-- **Tatoeba Project:** Released under [Creative Commons Attribution 2.0 France (CC-BY 2.0 FR)](https://creativecommons.org/licenses/by/2.0/fr/). Sentence data contributed by the Tatoeba community.
-- **JMdict & KANJIDIC2:** Property of the [Electronic Dictionary Research and Development Group (EDRDG)](http://www.edrdg.org/), used in conformance with the [EDRDG Licence](http://www.edrdg.org/edrdg/licence.html) (Creative Commons Attribution-ShareAlike 3.0 Unported).
-- **Pipeline Implementation:** Released under the [GNU General Public License v3.0 (GPL-3.0)](LICENSE).
+## Sources and licences
+
+- [Tatoeba downloads](https://tatoeba.org/en/downloads) and
+  [attribution guidance](https://en.wiki.tatoeba.org/articles/show/faq).
+  The sentence exports are supplied under CC BY 2.0 FR. We will retain source
+  links and attribution notices. A current owner username is not necessarily
+  the original author.
+- [JMdict/EDICT overview](https://www.edrdg.org/jmdict/edict.html) and
+  [KANJIDIC2 documentation](https://www.edrdg.org/kanjidic/kanjidic2_dtdh.html).
+  We use JMdict rather than duplicate it with the legacy EDICT export.
+- [EDRDG licence statement](https://www.edrdg.org/edrdg/licence.html).
+  Its current statement specifies CC BY-SA 4.0 for the dictionary material.
+  Distributed derived dictionary data will retain the applicable attribution
+  and share-alike requirements. Source acknowledgements will also appear in the UI.
+- Project code is licensed under [GPL v3](LICENSE). This does not replace the
+  licences of the source datasets.
