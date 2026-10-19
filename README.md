@@ -1,240 +1,211 @@
-# Japanese Vocabulary and Example Lookup
+# BTS Flight Operations and Airport Weather
 
-DAT535 course project by Alexander Kvalvaag and Christopher Liebich Kolle.
+DAT535 course project (Group 07) by Alexander Kvalvaag and Christopher Liebich Kolle.
 
-We are building a PySpark batch pipeline that combines Japanese example sentences,
-dictionary entries and kanji information. A simple web interface will let users
-look up a word, see its readings and possible definitions, and find example
-sentences with English translations. We may also add an Anki export using the
-same prepared data.
+We are building a PySpark batch pipeline that combines Bureau of Transportation Statistics (BTS) flight operations with National Oceanic and Atmospheric Administration (NOAA) airport weather data. The pipeline outputs daily departure-delay and cancellation summaries for John F. Kennedy International Airport (JFK) and LaGuardia Airport (LGA), accompanied by data-quality and weather-coverage metrics.
 
-The main work is in the pipeline: modelling the sources, connecting them,
-checking data quality, testing the processing and publishing reproducible outputs.
-The interface is a small demonstration of the result.
+The primary focus is on data engineering within a Medallion architecture: robust ingestion, explicit domain modelling, anomaly handling, consistency verification, scalable Spark transformations, and reproducible automated runs.
 
-## Current status
+---
 
-This project is in the setup and proof-of-concept stage. As of 8 October 2026:
+## Current Status
 
-- The repository has been cloned to the Spark VM.
-- The original source files have been downloaded outside the repository.
-- Download URLs, sizes, modification dates and checksums are recorded in a manifest.
-- SudachiPy has been tested on a Japanese sentence, and its dependencies are pinned.
-- Token-to-JMdict matching has not been tested yet.
-- The Silver and Gold processing, web interface, tests and project-specific GitHub
-  Actions workflows are not implemented yet.
+The project is currently in the definition and specification stage (as of October 2026):
 
-The sections below describe the planned pipeline, not completed features.
+- **Project definition:** Scope, datasets, schema modelling, and Medallion pipeline architecture defined.
+- **Initial data inspection:** Completed on historical reference inputs:
+  - Full June 2024 BTS file: 611,132 rows and 109 named columns (~276.8 MB uncompressed).
+  - Two full-year 2024 LCDv2 weather station files for JFK and LGA (~18.6 MB uncompressed).
+  - Total inspected input: ~295.4 MB.
+  - Inspected records identified 5,465 next-day departures, 84 midnight departures reported as `2400`, and 12 elapsed-time arithmetic discrepancies.
+- **Target evaluation window:** June–August 2025 selected for pipeline development and evaluation (subject to official source availability and coverage).
+- **Next steps:** Ingest 2025 raw data into Bronze, generate baseline manifests, and implement Silver parsing and validation routines.
 
-## Scope
+---
 
-The required version will support Japanese dictionary written forms and readings.
-It will combine:
+## Scope and Boundaries
 
-- **Tatoeba:** Japanese sentences, English translations and sentence tags.
-- **JMdict:** written forms, readings, parts of speech and English definitions.
-- **KANJIDIC2:** meanings, readings and metadata for individual kanji characters.
+### In Scope
+- **Flight cleaning & validation:** Full national monthly BTS Reporting Carrier On-Time Performance files.
+- **Weather enrichment & analysis:** Station-level observations for JFK and LGA.
+- **Temporal coverage:** June–August 2025 for development and evaluation.
+- **Outputs:** Daily flight operations, departure delay summaries, cancellation statistics, and data quality/coverage reports.
 
-We will use an existing tokenizer rather than build one. Dictionary matches are
-candidates, not automatic identification of the correct meaning in a sentence.
-Even a unique dictionary entry may contain several senses.
+### Out of Scope (Non-Goals)
+- No predictive machine learning models or forecasting.
+- No real-time streaming pipeline (batch processing only).
+- No web application or interactive user dashboard.
+- No reconstruction of multi-leg diversion itineraries.
+- No causal claims: the project documents empirical associations between weather metrics and delays, not causality.
 
-JESC, audio, user accounts, translation models and automatic grammar
-correction are outside the required scope. We will not assign sentence-level
-JLPT ratings. Individual kanji meanings and readings do not necessarily give
-the meaning or pronunciation of a whole word.
+---
 
-## Sources
+## Datasets and Sources
 
-| Source | Files used | Role |
-| --- | --- | --- |
-| Tatoeba | Japanese and English detailed sentences, Japanese–English links, and tags for both languages (`.tsv.bz2`) | Examples and translation relationships |
-| JMdict | Japanese–English dictionary (`JMdict_e.gz`, compressed XML) | Vocabulary entries and possible definitions |
-| KANJIDIC2 | `kanjidic2.xml.gz` | Character information |
+| Source | Dataset | Role | Primary Fields |
+| --- | --- | --- | --- |
+| **BTS** | Reporting Carrier On-Time Performance | Flight operations, delays, and cancellations | Flight date, carrier ID, flight number, origin, destination, scheduled/actual local times, departure delays, elapsed times, taxi times, cancellation codes, diversion indicators |
+| **NOAA** | Local Climatological Data version 2 (LCDv2) | Airport weather observations | Station identifier, timestamp, report type, temperature, wind speed/direction, visibility, precipitation |
 
-The initial download contains about 53 MB of compressed files. The five Tatoeba
-files total about 43 MB compressed, JMdict about 63 MB uncompressed, and
-KANJIDIC2 about 16 MB uncompressed. These are measurements of our downloaded
-files, not fixed dataset sizes.
+### Data Management Principles
+- **Off-repository storage:** Large raw archives and Parquet tables are kept outside Git in dedicated data directories.
+- **Provenance:** Official bulk releases, URLs, retrieval timestamps, file sizes, and SHA-256 checksums are tracked in run manifests.
+- **Airport reference mapping:** A static reference table maps JFK and LGA airport codes to their corresponding NOAA LCDv2 station identifiers and local time conventions (Eastern Time / UTC offsets).
 
-The Tatoeba snapshot dated 3 October 2026 contains 248,924 Japanese sentences,
-2,038,137 English sentences and 280,716 Japanese–English links. The English file
-contains all English sentences in that export, not just translations of Japanese.
-The dictionary files downloaded on 8 October have their own source dates.
-We will profile their entry counts during development.
+---
 
-This data fits on one machine. We use Spark to implement partition-based
-processing, relational joins and quality summaries, and to measure relevant
-performance choices. We do not claim that this workload requires a cluster.
+## Architecture and Pipeline
 
-## Planned pipeline
+The pipeline follows a three-stage Medallion architecture using PySpark:
 
-### Bronze: preserve the downloads
-
-Bronze retains the original compressed files without changing their contents.
-A run manifest identifies the exact combination of source versions used and
-records URLs, retrieval times, source modification dates, file sizes and SHA-256
-checksums. The sources are published independently and need not share a date.
-
-We plan to check for updates weekly through GitHub Actions, after Tatoeba's
-Saturday export. Each export is a full snapshot, not an incremental batch to
-append to an existing sentence table. Unchanged content can be reused, while
-new versions remain separate. Detecting changes before downloading will depend
-on available HTTP metadata, with checksums verifying downloaded content.
-
-Failed downloads and corrupt archives must not replace a working published
-version. The initial one-off download is not yet the scheduled ingestion pipeline.
-
-### Silver: model, validate and connect the sources
-
-We plan to store validated tables as Parquet. Their keys will include a source
-snapshot or version identifier where needed to distinguish historical records.
-
-| Table or relationship | One row represents |
-| --- | --- |
-| Sentences | A sentence ID within a Tatoeba snapshot |
-| Translation links | A Japanese–English ID pair within a snapshot |
-| Sentence tags | A sentence–tag relationship |
-| Dictionary entries, forms, readings and senses | A dictionary entity or child record within a JMdict version |
-| Sentence tokens | A token position within a sentence and tokenizer version |
-| Token matches | A token–dictionary-entry candidate, including the matching rule |
-| Kanji records and readings/meanings | A character record or child record within a KANJIDIC2 version |
-| Word–kanji relationships | A distinct character occurring in a dictionary written form |
-
-Processing will include:
-
-1. Parse explicit schemas, cast IDs and dates, and convert Tatoeba's `\N` to null.
-2. Validate required fields and references. Quarantine malformed records and
-   broken links with their original values and a reason. Missing optional owners
-   or dates are reported, not automatically rejected.
-3. Preserve distinct translation alternatives. Aggregate tags before enriching
-   pairs so several tags do not accidentally multiply the examples.
-4. Parse JMdict reading and sense restrictions without creating invalid
-   combinations of written forms, readings and meanings.
-5. Tokenise each Japanese sentence once, retaining surface text, dictionary form,
-   reading, part of speech and token positions. Reuse tokenizer instances within
-   Spark partitions.
-6. Match dictionary forms to candidate JMdict entries. Reading information can
-   help where compatible, but a token's reading is not necessarily the reading of
-   its dictionary form. Any script normalisation or fallback rule will be explicit
-   and tested. Unmatched and ambiguous tokens are not automatically bad data.
-7. Connect characters in written forms to KANJIDIC2 and report unmatched kanji.
-
-Original text will remain available. If we add normalised text, token offsets
-will identify which text representation they refer to. Character handling will
-not assume that every kanji fits a narrow Unicode range.
-
-Quality reports will include input/output counts, broken references, missing
-metadata, translation coverage, candidate-match coverage and ambiguity. We will
-separate structural validation from linguistic uncertainty. Tatoeba warning tags
-are useful signals, but their presence or absence does not prove correctness.
-
-We will reconcile accepted, rejected and explicitly deduplicated records and
-check relationship keys. Snapshot comparisons will identify additions, changes
-and removals. A small manually reviewed sample will help assess matching
-usefulness without claiming to validate the whole corpus.
-
-### Gold: prepare lookup outputs
-
-Gold will package vocabulary, candidate definitions, translated examples and
-kanji information for the lookup interface. We plan to use SQLite as the serving
-database, so a user search does not start a Spark job.
-
-The interface will show a limited set of examples using stated selection rules,
-such as length limits and review-warning tags. A linked English translation is
-not a verified translation. Kanji details will be displayed separately from word
-definitions, and results will retain source references.
-
-A new serving version will only become ready after export and validation succeed.
-Failed runs will leave the previous version available. An optional Anki export
-could use the same Gold data, with one target word and selected example per card.
-
-## Testing and performance
-
-Planned fixtures cover missing endpoints, invalid dates, duplicate pairs,
-multiple tags and translations, inflected forms, dictionary restrictions and
-ambiguous matches. Tests will check schemas, keys, count reconciliation,
-matching rules, deterministic reruns and known lookup queries.
-
-We will use both DataFrame operations and Spark SQL. Performance comparisons
-will use the same inputs and record repeated runtimes, execution plans and
-shuffle metrics where available. Broadcast joins, caching and partition counts
-will be chosen based on measurements, not prescribed in advance. Coverage
-thresholds will be justified after profiling rather than assumed to be 99%.
-
-## Development and automation
-
-Development will use small fixed samples, with separate dev and prod output
-paths. Planned GitHub Actions workflows will run tests, support manual runs,
-and check for weekly updates. Code changes will be reviewed through pull
-requests, and production runs will use an environment approval gate. Logs,
-manifests, quality reports and serving outputs will be retained as artifacts.
-
-The runner previously registered to the lab repository does not automatically
-serve this repository. Project runner access and workflows still need setup.
-
-## Current VM setup
-
-```text
-/home/ubuntu/project_07/          Code, documentation and dependency pins
-/home/ubuntu/project-data/       Downloaded datasets and future processing outputs
+```
+[ BTS Monthly Files ]      [ NOAA LCDv2 Stations ]
+          │                           │
+          ▼                           ▼
+┌──────────────────────────────────────────────────┐
+│              Bronze (Preservation)               │
+│  - Raw archives preserved unchanged             │
+│  - Manifests: URLs, timestamps, SHA-256 hashes   │
+│  - Strict schema & corruption validation        │
+└─────────────────────────┬────────────────────────┘
+                          │
+                          ▼
+┌──────────────────────────────────────────────────┐
+│          Silver (Cleaning & Enrichment)          │
+│  - Candidate key deduplication & audit counts    │
+│  - Operational states (cancellations/diversions) │
+│  - Departure date & 2400/rollover reconstruction │
+│  - UTC timestamp conversion                      │
+│  - Elapsed time consistency checks               │
+│  - Hourly routine weather parsing (trace/tokens) │
+│  - Scheduled departure hour left join            │
+│  - Quarantined records & quality reports         │
+└─────────────────────────┬────────────────────────┘
+                          │
+                          ▼
+┌──────────────────────────────────────────────────┐
+│             Gold (Daily Summaries)               │
+│  - Daily aggregations for JFK & LGA              │
+│  - Decoupled daily weather summary join          │
+│  - Delay metrics, eligible counts, cancellations │
+│  - Parquet, CSV, & analysis notebook             │
+└──────────────────────────────────────────────────┘
 ```
 
-The initial Bronze download is at:
+### Bronze: Ingestion and Preservation
+
+- Raw BTS `.zip` archives and NOAA LCDv2 CSV files are stored unmodified in the Bronze storage layer.
+- A **manifest** is recorded for every retrieval containing source URLs, retrieval timestamps, file sizes, SHA-256 checksums, dataset versions, and run configurations.
+- Archive members are inventoried during extraction, keeping unpacked working copies separated.
+- **Failure policy:** Missing source files, corrupt downloads, or unexpected schemas trigger immediate job failures rather than silently dropping records or degrading coverage.
+- **Idempotence & Updates:** Monthly GitHub Actions check for newly published data months. Runs without new or modified source data exit without rebuilding existing outputs. Backfills and manual runs process historical periods on demand.
+
+### Silver: Cleaning, Model, and Verification
+
+Silver models the domain, cleans raw fields, isolates invalid data, and joins flight operations with weather observations:
+
+- **Data model and keys:**
+  - BTS does not provide a single universal flight ID. We evaluate a composite candidate key: `FlightDate`, `Reporting_Airline`, `Flight_Number_Reporting_Airline`, `Origin`, `Dest`, and `CRSDepTime`.
+  - Exact duplicate rows are deduplicated with an audit count.
+  - Conflicting keys (different records sharing the same candidate key) are quarantined for review rather than resolved arbitrarily.
+  - Validated clean tables, quarantined records, and quality metrics are stored as Parquet with source provenance retained.
+- **Operational states and typing:**
+  - Explicit parsing of dates, integers, floats, and categorical flags.
+  - Cancelled and diverted flights are treated according to valid operational states:
+    - Cancelled flights may legitimately report departure times (e.g., gate departures prior to cancellation).
+    - Diverted flights legitimately lack standard arrival or elapsed-time values.
+  - Blanket null filtering and arbitrary zero-filling are strictly avoided. Unparseable required values are routed to quarantine with the original payload and error reason. Suspicious but interpretable values receive quality flags.
+- **Departure time reconstruction:**
+  - BTS formats clock times as integer `HHMM` (from `0001` to `2400`, where `2400` denotes midnight).
+  - Actual departure dates and timestamps are reconstructed using scheduled date/time plus signed departure delay, cross-checked against the reported actual clock.
+  - This accurately resolves midnight rollovers, departures delayed into subsequent days, and negative delays (early departures).
+  - Departure timestamps for JFK and LGA are converted to UTC using airport local time and daylight-saving rules.
+- **Consistency checks:**
+  - For completed flights, verify that `ActualElapsedTime == AirTime + TaxiIn + TaxiOut`. (In the June 2024 inspection, 12 records had discrepancies; these are flagged for review).
+- **Weather preprocessing:**
+  - LCDv2 records mix routine hourly (`FM-15`), special, daily, and monthly summaries.
+  - Routine hourly reports are extracted and filtered to unique station-hour keys.
+  - Token handling: parses non-numeric tokens, distinguishes trace precipitation (retaining a trace flag) from zero precipitation, and handles variable wind directions.
+- **Enrichment:**
+  - Flight records for JFK and LGA are left-joined to hourly weather by airport station mapping and scheduled departure hour in UTC.
+  - Joining on scheduled departure hour provides cancelled flights with an objective planned-time weather reference.
+  - Unmatched weather observations remain visible in coverage reports; the join cardinality preserves total flight records without multiplication.
+- **Verification and quality reporting:**
+  - Complete accounting: every input row is accounted for as retained, quarantined, or deduplicated.
+  - Overlapping validation flags are tracked without inflating error counts.
+  - Synthetic test fixtures cover edge cases: midnight (`2400`), early departures, multi-day delays, cancellations, diversion nulls, conflicting keys, and weather token parsing.
+
+### Spark and Scaling Considerations
+
+- Transform data using the DataFrame API and Spark SQL, preferring native built-in functions over Python UDFs for performance and catalyst optimization.
+- Prune unnecessary columns early to reduce memory pressure and I/O.
+- Partition Silver tables by year and month to facilitate incremental processing and historical backfills.
+- Benchmark and document partition counts, join strategies (e.g., broadcast vs. sort-merge), caching decisions, execution plans, and shuffle metrics.
+
+### Gold: Daily Airport Summaries
+
+Gold produces business-ready daily aggregations for JFK and LGA:
+
+- **Grain:** One row per scheduled flight date and origin airport.
+- **Metrics:**
+  - Total scheduled operations.
+  - Cancellation count and cancellation rate (with explicit, documented denominators).
+  - Diversion count.
+  - Departure-delay metrics (mean, median, 90th percentile) calculated over explicitly reported eligible flights.
+  - Weather summary metrics and coverage indicators.
+- **Unbiased weather aggregation:** Weather metrics are aggregated to daily values prior to joining with daily flight summaries, preventing daily weather statistics from being weighted by flight volume.
+- **Delivery:** Stored as Parquet and CSV files. A lightweight exploratory notebook evaluates empirical associations between weather conditions and delay patterns.
+- **Readiness manifest:** Gold updates produce a readiness manifest verifying input checksums and data quality checks before publishing.
+
+---
+
+## Execution and Deployment
+
+The pipeline executes on the project's dedicated Spark VM environment:
+
+- **Continuous Integration (CI):** Pull requests run unit tests, schema assertions, and synthetic fixture validations.
+- **Environments:** Development (`dev`) and production (`prod`) outputs are written to separate directory structures.
+- **Automation:** Monthly automated runs ingest newly released data via GitHub Actions; manual workflow dispatches support backfilling historical ranges.
+- **Auditability:** Execution logs, manifests, and quality audit tables are persisted with every pipeline run.
+
+---
+
+## Environment and VM Setup
+
+### Directory Conventions
 
 ```text
-/home/ubuntu/project-data/bronze/2026-10-08/20261008T091537Z-a582484d/
-├── manifest.json
-├── tatoeba/
-│   ├── jpn_sentences_detailed.tsv.bz2
-│   ├── eng_sentences_detailed.tsv.bz2
-│   ├── jpn-eng_links.tsv.bz2
-│   ├── jpn_tags.tsv.bz2
-│   └── eng_tags.tsv.bz2
-├── jmdict/JMdict_e.gz
-└── kanjidic2/kanjidic2.xml.gz
+/home/ubuntu/project_07/          Repository code, configuration, tests, and documentation
+/home/ubuntu/project-data/        External data storage (excluded from Git)
+├── bronze/                      Raw BTS archives and NOAA station downloads
+├── silver/                      Cleaned Parquet tables, quarantine, and audit metrics
+└── gold/                        Daily summary Parquet/CSV files and readiness manifests
 ```
 
-Full downloads and generated databases do not belong in Git. Small test fixtures
-will be stored in the repository. The data root will be configurable as the
-pipeline is implemented.
+### Setup Instructions
 
-Clone the repository with:
+Clone the repository:
 
 ```bash
 git clone https://github.com/dat535-group07-2026/project_07.git
 cd project_07
 ```
 
-On the existing Spark VM, activate the lab environment with:
+Activate the Spark environment on the VM:
 
 ```bash
 source /home/ubuntu/spark-env/bin/activate
 python -m pip install -r requirements.txt
 ```
 
-The tested tokenizer versions are `SudachiPy==0.6.11` and
-`SudachiDict-core==20260723`. Python is 3.11.15. The environment currently reports
-PySpark 4.2.0, but compatibility with the VM's Java and Spark runtime still needs
-verification. The dependency file currently covers only the tokenizer setup,
-not a complete pipeline installation.
+---
 
-There is no full-pipeline command yet. The next step is a small token-to-JMdict
-matching experiment before implementing the Silver tables.
+## References and Licences
 
-## Sources and licences
+### Source Data References
+1. **BTS Field Definitions:** [BTS TranStats On-Time Performance Fields](https://www.transtats.bts.gov/Fields.asp?gnoyr_VQ=FGJ)
+2. **BTS Time Reporting Directive:** [BTS Number 31 Technical Directive: Time Reporting Instructions](https://www.bts.gov/topics/airlines-and-airports/number-31-technical-directive-time-reporting-effective-jan-1-2019)
+3. **NOAA Weather Documentation:** [NOAA Local Climatological Data (LCD) v2 Documentation](https://www.ncei.noaa.gov/oa/local-climatological-data/v2/doc/lcdv2_DOCUMENTATION.pdf)
 
-- [Tatoeba downloads](https://tatoeba.org/en/downloads) and
-  [attribution guidance](https://en.wiki.tatoeba.org/articles/show/faq).
-  The sentence exports are supplied under CC BY 2.0 FR. We will retain source
-  links and attribution notices. A current owner username is not necessarily
-  the original author.
-- [JMdict/EDICT overview](https://www.edrdg.org/jmdict/edict.html) and
-  [KANJIDIC2 documentation](https://www.edrdg.org/kanjidic/kanjidic2_dtdh.html).
-  We use JMdict rather than duplicate it with the legacy EDICT export.
-- [EDRDG licence statement](https://www.edrdg.org/edrdg/licence.html).
-  Its current statement specifies CC BY-SA 4.0 for the dictionary material.
-  Distributed derived dictionary data will retain the applicable attribution
-  and share-alike requirements. Source acknowledgements will also appear in the UI.
-- Project code is licensed under [GPL v3](LICENSE). This does not replace the
-  licences of the source datasets.
+### Project Licence
+The project code is licensed under [GNU General Public License v3.0](LICENSE). Source datasets remain subject to their respective government open-data terms and conditions.
