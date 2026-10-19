@@ -1,2 +1,2 @@
-SudachiPy==0.6.11
-SudachiDict-core==20260723
+# Project Spark dependency; align the VM environment before running Silver.
+pyspark==3.5.0

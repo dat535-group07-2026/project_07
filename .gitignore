@@ -218,3 +218,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project datasets, generated outputs and Spark local state
+/data/
+/artifacts/
+/spark-warehouse/
+/metastore_db/
+/derby.log
+.env.*
+!.env.example
+
+# Local Silver implementation handoff
+/docs/silver-work-split.md
