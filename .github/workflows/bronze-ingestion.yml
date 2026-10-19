@@ -1,0 +1,114 @@
+name: Bronze ingestion
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Verify existing files, download a range, or check for new releases
+        type: choice
+        options: [verify, manual, new]
+        default: verify
+      start_month:
+        description: First month for verify or manual (YYYY-MM)
+        type: string
+        default: '2025-06'
+      end_month:
+        description: Last month for verify or manual (YYYY-MM)
+        type: string
+        default: '2025-09'
+  schedule:
+    # First day of each month at 06:17 UTC.
+    - cron: '17 6 1 * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: project07-bronze
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    runs-on: [self-hosted, Linux, X64, project-07]
+    timeout-minutes: 120
+    env:
+      DATA_ROOT: /home/ubuntu/project-data
+      OPERATION: ${{ github.event_name == 'schedule' && 'new' || inputs.operation }}
+      START_MONTH: ${{ inputs.start_month || '2025-06' }}
+      END_MONTH: ${{ inputs.end_month || '2025-09' }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Run ingestion tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Prepare run report directory
+        run: |
+          mkdir -p "$RUNNER_TEMP/bronze-artifacts"
+          touch "$RUNNER_TEMP/bronze-start"
+
+      - name: Ingest Bronze inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$OPERATION" in
+            verify)
+              python3 scripts/ingest_bronze.py manual --start "$START_MONTH" --end "$END_MONTH" --data-root "$DATA_ROOT" --offline
+              ;;
+            manual)
+              python3 scripts/ingest_bronze.py manual --start "$START_MONTH" --end "$END_MONTH" --data-root "$DATA_ROOT"
+              ;;
+            new)
+              python3 scripts/ingest_bronze.py new --data-root "$DATA_ROOT"
+              ;;
+            *)
+              printf 'Unknown operation: %s\n' "$OPERATION" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Collect run manifests
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bronze-artifacts"
+          if [[ -f "$RUNNER_TEMP/bronze-start" && -d "$DATA_ROOT/bronze/runs" ]]; then
+            find "$DATA_ROOT/bronze/runs" -maxdepth 1 -name '*.json' -type f \
+              -newer "$RUNNER_TEMP/bronze-start" -exec cp -t "$RUNNER_TEMP/bronze-artifacts" {} +
+          fi
+          if [[ -f "$DATA_ROOT/bronze/catalog.json" ]]; then
+            cp "$DATA_ROOT/bronze/catalog.json" "$RUNNER_TEMP/bronze-artifacts/catalog.json"
+          fi
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          reports = Path(os.environ['RUNNER_TEMP']) / 'bronze-artifacts'
+          with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as summary:
+              summary.write('## Bronze ingestion\n\n')
+              summary.write(f"Operation: `{os.environ['OPERATION']}`\n\n")
+              runs = sorted(path for path in reports.glob('*.json') if path.name != 'catalog.json')
+              if not runs:
+                  summary.write('No ingestion run manifest was created. Check the job logs.\n')
+              for path in runs:
+                  report = json.loads(path.read_text())
+                  summary.write(f"Status: **{report['status']}**\n\n")
+                  summary.write(f"Verified/downloaded source files: {len(report['sources'])}\n\n")
+                  summary.write(f"Unavailable months: {len(report['unavailable_months'])}\n\n")
+                  if report.get('message'):
+                      summary.write(report['message'] + '\n\n')
+          PY
+
+      - name: Upload ingestion reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bronze-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bronze-artifacts/*.json
+          if-no-files-found: warn
+          retention-days: 14
