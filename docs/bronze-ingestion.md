@@ -56,16 +56,18 @@ downloads. Network failures, permissions errors and invalid downloads fail the
 run instead of being treated as missing months. When new flights are retrieved,
 the matching annual weather files are refreshed too.
 
-The script itself does not schedule runs. The GitHub Actions workflow described
-below calls `new` monthly. The first check after a long gap can download several
-months, so preview it before running manually.
+The script itself does not schedule runs. The workflow's monthly schedule is
+currently paused, so `new` runs only when dispatched manually. The first check
+after a long gap can download several months, so preview it before running it.
 
 ## GitHub Actions
 
 The `Bronze ingestion` workflow runs on the VM's `spark-vm-project07` runner,
-labelled `project-07`. It runs on the first day of each month at 06:17 UTC and
-checks for new BTS months. Missing releases are retried in later runs. This is
-a batch schedule, not real-time ingestion, and it does not yet run Silver or Gold.
+labelled `project-07`. Its monthly schedule (first day of the month, 06:17 UTC)
+is paused while Silver is developed on fixed June-October 2025 inputs. An
+unbounded `new` run would check every month from 2025-11 onward and refresh the
+2025 weather files. Re-enable it only with a bounded `--since`/`--through`
+policy. The workflow does not yet run Silver or Gold.
 
 Under GitHub Actions, select **Bronze ingestion**, then **Run workflow**:
 
