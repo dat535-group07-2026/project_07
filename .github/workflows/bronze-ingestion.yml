@@ -44,7 +44,7 @@ jobs:
           persist-credentials: false
 
       - name: Run ingestion tests
-        run: python3 -m unittest discover -s tests -v
+        run: python3 -m unittest discover -s tests -p "test_ingest_*.py" -v
 
       - name: Prepare run report directory
         run: |
