@@ -10,16 +10,13 @@ The primary focus is on data engineering within a Medallion architecture: robust
 
 ## Current Status
 
-The project is currently in the definition and specification stage (as of October 2026):
+Status as of 22 October 2026 (deadline, including the report: 20 November 2026):
 
-- **Project definition:** Scope, datasets, schema modelling, and Medallion pipeline architecture defined.
-- **Initial data inspection:** Completed on historical reference inputs:
-  - Full June 2024 BTS file: 611,132 rows and 109 named columns (~276.8 MB uncompressed).
-  - Two full-year 2024 LCDv2 weather station files for JFK and LGA (~18.6 MB uncompressed).
-  - Total inspected input: ~295.4 MB.
-  - Inspected records identified 5,465 next-day departures, 84 midnight departures reported as `2400`, and 12 elapsed-time arithmetic discrepancies.
-- **Target evaluation window:** June–August 2025 selected for pipeline development and evaluation (subject to official source availability and coverage).
-- **Next steps:** Ingest 2025 raw data into Bronze, generate baseline manifests, and implement Silver parsing and validation routines.
+- **Bronze: implemented and tested.** National BTS months June–October 2025 and the 2025 LCDv2 files for JFK and LGA are ingested, checksummed, and catalogued (3,013,664 flight rows; 1.38 GB raw CSV). See [docs/bronze-ingestion.md](docs/bronze-ingestion.md).
+- **Silver and Gold: designed, not yet implemented.** The Silver and Gold sections below describe the planned design.
+- **Evaluation window:** June–October 2025.
+- **Decisions and evidence:** Runtime, evaluation window, time conventions, and measured data quality are recorded in [docs/decisions.md](docs/decisions.md).
+- **Historical inspection:** An earlier inspection of June 2024 inputs (611,132 flights; 5,465 next-day departures, 84 `2400` departures, 12 elapsed-time discrepancies) guided the design. These figures do not describe the 2025 inputs.
 
 ---
 
@@ -28,7 +25,7 @@ The project is currently in the definition and specification stage (as of Octobe
 ### In Scope
 - **Flight cleaning & validation:** Full national monthly BTS Reporting Carrier On-Time Performance files.
 - **Weather enrichment & analysis:** Station-level observations for JFK and LGA.
-- **Temporal coverage:** June–August 2025 for development and evaluation.
+- **Temporal coverage:** June–October 2025 for development and evaluation.
 - **Outputs:** Daily flight operations, departure delay summaries, cancellation statistics, and data quality/coverage reports.
 
 ### Out of Scope (Non-Goals)
@@ -50,7 +47,7 @@ The project is currently in the definition and specification stage (as of Octobe
 ### Data Management Principles
 - **Off-repository storage:** Large raw archives and Parquet tables are kept outside Git in dedicated data directories.
 - **Provenance:** Official bulk releases, URLs, retrieval timestamps, file sizes, and SHA-256 checksums are tracked in run manifests.
-- **Airport reference mapping:** A static reference table maps JFK and LGA airport codes to their corresponding NOAA LCDv2 station identifiers and local time conventions (Eastern Time / UTC offsets).
+- **Airport reference mapping (planned for Silver):** A static reference table maps JFK and LGA airport codes to their NOAA LCDv2 station identifiers (`USW00094789`, `USW00014732`) and time conventions. BTS clock times are local civil time (Eastern Time with daylight saving). LCDv2 `DATE` values are Local Standard Time, a fixed UTC−5 offset without daylight saving (see [docs/decisions.md](docs/decisions.md), D5).
 
 ---
 
@@ -95,12 +92,14 @@ The pipeline follows a three-stage Medallion architecture using PySpark:
 ### Bronze: Ingestion and Preservation
 
 - Raw BTS `.zip` archives and NOAA LCDv2 CSV files are stored unmodified in the Bronze storage layer.
-- A **manifest** is recorded for every retrieval containing source URLs, retrieval timestamps, file sizes, SHA-256 checksums, dataset versions, and run configurations.
+- A **catalog** records every source version with its URL, retrieval timestamp, file size, and SHA-256 checksum. A **run manifest** records each run's mode, requested months, selected inputs, and outcome.
 - Archive members are inventoried during extraction, keeping unpacked working copies separated.
 - **Failure policy:** Missing source files, corrupt downloads, or unexpected schemas trigger immediate job failures rather than silently dropping records or degrading coverage.
 - **Idempotence & Updates:** A monthly GitHub Actions check for new data months exists but is paused during Silver development. Runs without new or modified source data exit without rebuilding existing outputs. Backfills and manual runs process historical periods on demand.
 
 ### Silver: Cleaning, Model, and Verification
+
+*Planned design; not yet implemented.*
 
 Silver models the domain, cleans raw fields, isolates invalid data, and joins flight operations with weather observations:
 
@@ -121,11 +120,12 @@ Silver models the domain, cleans raw fields, isolates invalid data, and joins fl
   - This accurately resolves midnight rollovers, departures delayed into subsequent days, and negative delays (early departures).
   - Departure timestamps for JFK and LGA are converted to UTC using airport local time and daylight-saving rules.
 - **Consistency checks:**
-  - For completed flights, verify that `ActualElapsedTime == AirTime + TaxiIn + TaxiOut`. (In the June 2024 inspection, 12 records had discrepancies; these are flagged for review).
+  - For completed flights, verify that `ActualElapsedTime == AirTime + TaxiIn + TaxiOut`. A full scan of June–October 2025 found no discrepancies (the June 2024 inspection found 12); any future discrepancies are flagged for review.
 - **Weather preprocessing:**
   - LCDv2 records mix routine hourly (`FM-15`), special, daily, and monthly summaries.
   - Routine hourly reports are extracted and filtered to unique station-hour keys.
   - Token handling: parses non-numeric tokens, distinguishes trace precipitation (retaining a trace flag) from zero precipitation, and handles variable wind directions.
+  - Timestamps: `DATE` is converted to UTC with a fixed +5 hour offset (Local Standard Time), not with daylight-saving rules. Duplicated or missing labels around daylight-saving changes are flagged.
 - **Enrichment:**
   - Flight records for JFK and LGA are left-joined to hourly weather by airport station mapping and scheduled departure hour in UTC.
   - Joining on scheduled departure hour provides cancelled flights with an objective planned-time weather reference.
@@ -143,6 +143,8 @@ Silver models the domain, cleans raw fields, isolates invalid data, and joins fl
 - Benchmark and document partition counts, join strategies (e.g., broadcast vs. sort-merge), caching decisions, execution plans, and shuffle metrics.
 
 ### Gold: Daily Airport Summaries
+
+*Planned design; not yet implemented.*
 
 Gold produces business-ready daily aggregations for JFK and LGA:
 
@@ -163,10 +165,10 @@ Gold produces business-ready daily aggregations for JFK and LGA:
 
 The pipeline executes on the project's dedicated Spark VM environment:
 
-- **Continuous Integration (CI):** Pull requests run unit tests, schema assertions, and synthetic fixture validations.
-- **Environments:** Development (`dev`) and production (`prod`) outputs are written to separate directory structures.
-- **Automation:** Ingestion runs via manually dispatched GitHub Actions; the monthly schedule is paused during Silver development. Manual dispatches also support backfilling historical ranges.
-- **Auditability:** Execution logs, manifests, and quality audit tables are persisted with every pipeline run.
+- **Automation (implemented):** Bronze ingestion runs via manually dispatched GitHub Actions on a dedicated self-hosted runner; the monthly schedule is paused during Silver development. Manual dispatches also support backfilling historical ranges.
+- **Auditability (implemented for Bronze):** Bronze run manifests and the source catalog are persisted with every run. Silver and Gold quality audit tables are planned.
+- **Continuous Integration (planned):** Pull-request unit tests on GitHub-hosted runners with synthetic fixtures. The self-hosted runner is deliberately not exposed to pull requests.
+- **Environments (planned):** Development (`dev`) and production (`prod`) outputs are written to separate directory structures.
 
 ---
 
@@ -191,12 +193,21 @@ git clone https://github.com/dat535-group07-2026/project_07.git
 cd project_07
 ```
 
-Activate the Spark environment on the VM:
+The project uses Spark 3.5.0 on Java 8, matching `/opt/spark` on the VM. Use a virtual environment inside the checkout; do not install into the shared `/home/ubuntu/spark-env`, which contains an incompatible PySpark 4 (see [docs/decisions.md](docs/decisions.md), D1):
 
 ```bash
-source /home/ubuntu/spark-env/bin/activate
-python -m pip install -r requirements.txt
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
 ```
+
+Before running Spark jobs, use Java 8 and clear the VM's Jupyter driver settings:
+
+```bash
+export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
+unset PYSPARK_DRIVER_PYTHON PYSPARK_DRIVER_PYTHON_OPTS
+```
+
+Bronze ingestion and its tests need only Python 3.11 or later; see [docs/bronze-ingestion.md](docs/bronze-ingestion.md).
 
 ---
 
