@@ -105,8 +105,9 @@ Override it with `--data-root /absolute/path` after the subcommand.
 
 Downloads are staged before validation. The catalog is updated only after all
 required inputs for the run pass their checks. Failed runs keep the previous
-catalog and record the error in a run manifest. A retry can reuse verified files
-left by a failed batch. A local lock prevents overlapping ingestion runs.
+catalog and record the error in a run manifest. A retry downloads uncatalogued
+sources again, but reuses a stored file left by a failed batch when its checksum
+matches. A local lock prevents overlapping ingestion runs.
 
 The script does not filter flights, remove rows, fix nulls or interpret weather
 values. Those are Silver tasks. Header checks verify the input format, not the
