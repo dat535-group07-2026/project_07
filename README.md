@@ -98,7 +98,7 @@ The pipeline follows a three-stage Medallion architecture using PySpark:
 - A **manifest** is recorded for every retrieval containing source URLs, retrieval timestamps, file sizes, SHA-256 checksums, dataset versions, and run configurations.
 - Archive members are inventoried during extraction, keeping unpacked working copies separated.
 - **Failure policy:** Missing source files, corrupt downloads, or unexpected schemas trigger immediate job failures rather than silently dropping records or degrading coverage.
-- **Idempotence & Updates:** Monthly GitHub Actions check for newly published data months. Runs without new or modified source data exit without rebuilding existing outputs. Backfills and manual runs process historical periods on demand.
+- **Idempotence & Updates:** A monthly GitHub Actions check for new data months exists but is paused during Silver development. Runs without new or modified source data exit without rebuilding existing outputs. Backfills and manual runs process historical periods on demand.
 
 ### Silver: Cleaning, Model, and Verification
 
@@ -165,7 +165,7 @@ The pipeline executes on the project's dedicated Spark VM environment:
 
 - **Continuous Integration (CI):** Pull requests run unit tests, schema assertions, and synthetic fixture validations.
 - **Environments:** Development (`dev`) and production (`prod`) outputs are written to separate directory structures.
-- **Automation:** Monthly automated runs ingest newly released data via GitHub Actions; manual workflow dispatches support backfilling historical ranges.
+- **Automation:** Ingestion runs via manually dispatched GitHub Actions; the monthly schedule is paused during Silver development. Manual dispatches also support backfilling historical ranges.
 - **Auditability:** Execution logs, manifests, and quality audit tables are persisted with every pipeline run.
 
 ---

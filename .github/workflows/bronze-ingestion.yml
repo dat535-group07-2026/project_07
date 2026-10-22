@@ -15,10 +15,11 @@ on:
       end_month:
         description: Last month for verify or manual (YYYY-MM)
         type: string
-        default: '2025-09'
-  schedule:
-    # First day of each month at 06:17 UTC.
-    - cron: '17 6 1 * *'
+        default: '2025-10'
+  # Monthly schedule paused while Silver is developed on fixed June-October 2025
+  # inputs. Choose a bounded --since/--through policy before re-enabling.
+  # schedule:
+  #   - cron: '17 6 1 * *'
 
 permissions:
   contents: read
@@ -35,7 +36,7 @@ jobs:
       DATA_ROOT: /home/ubuntu/project-data
       OPERATION: ${{ github.event_name == 'schedule' && 'new' || inputs.operation }}
       START_MONTH: ${{ inputs.start_month || '2025-06' }}
-      END_MONTH: ${{ inputs.end_month || '2025-09' }}
+      END_MONTH: ${{ inputs.end_month || '2025-10' }}
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
