@@ -482,24 +482,27 @@ def run_month(args) -> dict:
     started = time.monotonic()
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-") + uuid.uuid4().hex[:8]
     assets = select_inputs(bronze, [f"bts:{args.month}"])
+    # Local mode runs tasks inside the driver JVM. Spark's 1 GB default heap ran
+    # out of memory on June 2025 (about 277 MB of CSV), so set it before the JVM starts.
     spark = (SparkSession.builder.master("local[*]").appName(f"project07-flights-{args.month}")
+             .config("spark.driver.memory", "3g")
              .config("spark.sql.session.timeZone", "UTC")
              .config("spark.sql.ansi.enabled", "false")
              .config("spark.ui.enabled", "false").getOrCreate())
     spark.sparkContext.setLogLevel("WARN")
-    raw = classified = None
+    classified = None
     paths = {table: output / table / "runs" / run_id
              for table in ("flights", "flights_quarantine", "audit")}
     try:
-        # Reused across audits and writes; also isolates corrupt-record queries
-        # from Spark's restriction on direct CSV scans. Spill rather than collect.
-        raw = read_flights(spark, assets, bronze, run_id).persist(StorageLevel.MEMORY_AND_DISK)
+        # The raw rows are read twice (one count, one classification) instead of
+        # cached. The classified rows are reused by the audit, checks and three
+        # writes, so they are cached on disk: building in-memory columnar batches
+        # of the wide original struct exhausted the heap.
+        raw = read_flights(spark, assets, bronze, run_id)
         observed_raw = raw.count()
         tables = clean_flights(raw)
-        classified = tables.classified.persist(StorageLevel.MEMORY_AND_DISK)
+        classified = tables.classified.persist(StorageLevel.DISK_ONLY)
         counts = tables.audit.first().asDict()
-        raw.unpersist()
-        raw = None
         checks = check_accounting(counts, observed_raw)
         checks["quarantine_has_reasons"] = not tables.quarantined.filter(
             F.size("rejection_reasons") == 0).take(1)
@@ -572,8 +575,6 @@ def run_month(args) -> dict:
     finally:
         if classified is not None:
             classified.unpersist()
-        if raw is not None:
-            raw.unpersist()
         spark.stop()
 
 
