@@ -444,6 +444,11 @@ def dev_output_root(data_root: Path) -> Path:
     return output
 
 
+def current_pointer(output: Path, month: str) -> Path:
+    """One pointer per source month, so publishing one month leaves the others current."""
+    return output / "flights" / "current" / f"{_month(month)}.json"
+
+
 def _input_snapshot(assets, root):
     return [{"asset_id": a.asset_id, "kind": a.kind, "version_sha256": a.version_sha256,
              "csvs": [{"path": str(c.path.relative_to(root)), "sha256": c.sha256,
@@ -560,13 +565,14 @@ def run_month(args) -> dict:
                   "assumptions": "PR #3 defaults and flights-0.1-working; awaiting Monday review",
                   "outputs": {name: str(path.relative_to(output)) for name, path in paths.items()}}
         # Prepare all companion tables before committing one authoritative pointer.
-        # Temporary runner: only flights/current.json is advanced. Its readiness
-        # manifest identifies quarantine and audit from this exact run. Separate
-        # table pointers would permit a partial cross-table publication on failure.
-        # Agree the final multi-table pointer interface with the common.py owner.
+        # Temporary runner: only the month's flights pointer is advanced. Its
+        # readiness manifest identifies quarantine and audit from this exact run.
+        # Separate table pointers would permit a partial cross-table publication
+        # on failure. Agree the final pointer interface with the common.py owner.
         for name, path in paths.items():
             _atomic_json(path / "_READY.json", {**report, "table": name})
-        _atomic_json(output / "flights" / "current.json", {
+        _atomic_json(current_pointer(output, args.month), {
+            "month": args.month,
             "run_id": run_id,
             "ready_manifest": str((paths["flights"] / "_READY.json").relative_to(output / "flights")),
         })

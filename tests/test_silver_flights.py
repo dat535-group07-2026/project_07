@@ -92,6 +92,17 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in self.root.iterdir()),
                          ["archive.zip", "current.json", "flights.csv"])
 
+    def test_publishing_one_month_keeps_other_months_current(self):
+        output = self.root / "silver" / "dev" / "alkval"
+        june, july = (flights.current_pointer(output, m) for m in ("2025-06", "2025-07"))
+        self.assertEqual(june, output / "flights" / "current" / "2025-06.json")
+        flights._atomic_json(june, {"month": "2025-06", "run_id": "june-run"})
+        flights._atomic_json(july, {"month": "2025-07", "run_id": "july-run"})
+        self.assertEqual(json.loads(june.read_text())["run_id"], "june-run")
+        self.assertEqual(json.loads(july.read_text())["run_id"], "july-run")
+        with self.assertRaises(Exception):
+            flights.current_pointer(output, "2025-6")
+
     def test_accounting_failure_is_not_accepted(self):
         counts = {"raw": 3, "duplicate_extras": 1, "unique": 2,
                   "scope_excluded": 0, "retained": 1, "quarantined": 1}
