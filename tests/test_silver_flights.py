@@ -133,6 +133,12 @@ def fixture(label, number, **changes):
                Cancelled="0.00", Diverted="0.00", CRSElapsedTime="120.00",
                ActualElapsedTime="120.00", AirTime="90.00", TaxiIn="10.00", TaxiOut="20.00")
     row.update(changes)
+    if "DepDelay" in changes and "DepDelayMinutes" not in changes:
+        # Keep the clipped delay consistent with BTS unless a fixture tests it.
+        try:
+            row["DepDelayMinutes"] = f"{max(float(changes['DepDelay']), 0):.2f}"
+        except (TypeError, ValueError):
+            row["DepDelayMinutes"] = None if changes["DepDelay"] is None else row["DepDelayMinutes"]
     return row
 
 
@@ -186,6 +192,10 @@ class FlightSparkTests(unittest.TestCase):
             fixture("invalid-clock", 30, DepTime="2561"),
             fixture("pruned-difference", 31, CarrierDelay=None),
             fixture("pruned-difference", 31, CarrierDelay="null"),
+            # Air time is negative but the components still sum to the elapsed time.
+            fixture("negative-duration", 32, AirTime="-10.00", TaxiOut="120.00"),
+            fixture("clip-mismatch", 33, DepDelayMinutes="0.00"),
+            fixture("negative-clipped", 34, DepTime="0955", DepDelay="-5.00", DepDelayMinutes="-5.00"),
         ]
         rows.extend([dict(rows[16]), dict(rows[17])])
         cls.fixture_rows = rows
@@ -310,6 +320,13 @@ class FlightSparkTests(unittest.TestCase):
         }.items():
             self.outcome(label, warnings=[code])
 
+    def test_minute_domain_violations_are_flagged_but_retained(self):
+        for label in ("negative-duration", "clip-mismatch", "negative-clipped"):
+            self.outcome(label, warnings=["F_MINUTE_DOMAIN"])
+        # A valid early departure clips to zero and is not flagged.
+        self.assertEqual(self.outcome("negative").dep_delay_nonnegative_min, 0)
+        self.assertEqual(self.counts["F_MINUTE_DOMAIN"], 3)
+
     def test_malformed_record_and_trailing_field(self):
         row = self.outcome("malformed", ["F_MALFORMED_RECORD"])
         self.assertEqual(row.original._corrupt_record, '"unterminated')
@@ -356,6 +373,24 @@ class FlightSparkTests(unittest.TestCase):
             self.assertEqual(actual.OriginCityName, "New York, NY")
             self.assertEqual(actual.source_file, path.name)
             self.assertEqual(actual.source_sha256, source.sha256)
+            self.assertIsNone(actual._corrupt_record)
+
+    def test_reader_handles_doubled_quotes_without_shifting_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            path = root / "doubled_quotes.csv"
+            row = fixture("doubled-quote", 98, OriginCityName='Say "Hi", NY')
+            buffer = io.StringIO()
+            writer = csv.writer(buffer)  # Writes the embedded quotes as "".
+            writer.writerow([*flights.BTS_COLUMNS, ""])
+            writer.writerow([row[name] for name in (*flights.BTS_COLUMNS, "_trailing_empty")])
+            path.write_text(buffer.getvalue())
+            source = flights.SelectedCsv(path, flights.file_hash(path), path.stat().st_size)
+            asset = flights.SelectedAsset("bts:2025-06", "bts", "a" * 64, [source])
+            actual = flights.read_flights(self.spark, [asset], root, "quote-test").first()
+            self.assertEqual(actual.OriginCityName, 'Say "Hi", NY')
+            self.assertEqual((actual.Origin, actual.Dest, actual.CRSDepTime), ("JFK", "LGA", "1000"))
+            self.assertIsNone(actual._trailing_empty)
             self.assertIsNone(actual._corrupt_record)
 
     def test_reader_rejects_short_and_long_lines_with_count(self):

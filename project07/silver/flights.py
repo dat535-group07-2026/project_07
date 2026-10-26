@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 
 LOG = logging.getLogger(__name__)
 DEFAULT_DATA_ROOT = Path("/home/ubuntu/project-data")
-RULE_VERSION = "flights-0.1-working"
+RULE_VERSION = "flights-0.2-working"
 PROVENANCE = (
     "source_asset_id", "source_file", "source_sha256", "silver_run_id", "rule_version",
 )
@@ -91,7 +91,16 @@ RULES = {
     "F_DURATION_MISMATCH": ("warning", "Completed elapsed minutes differ from air plus taxi minutes"),
     "F_CANCEL_CODE_MISMATCH": ("warning", "Cancellation code disagrees with a valid cancellation flag"),
     "F_NUMERIC_UNPARSEABLE": ("warning", "Nonblank optional minute/clock token cannot be parsed"),
+    "F_MINUTE_DOMAIN": ("warning", "Negative duration or clipped delay, or clipped delay differs from signed delay floored at zero"),
 }
+NONNEGATIVE_MINUTES = (
+    "dep_delay_nonnegative_min", "arr_delay_nonnegative_min", "scheduled_elapsed_min",
+    "actual_elapsed_min", "air_time_min", "taxi_in_min", "taxi_out_min",
+)
+CLIPPED_DELAYS = (
+    ("dep_delay_min", "dep_delay_nonnegative_min"),
+    ("arr_delay_min", "arr_delay_nonnegative_min"),
+)
 
 
 # Temporary common.select_inputs stand-in. Keep the PR #3 dataclass signature.
@@ -199,6 +208,10 @@ def read_flights(spark: SparkSession, assets: list[SelectedAsset], bronze_root: 
                     f"110 fields (109 commas): {source.path}")
             frame = (spark.read.schema(raw_schema()).option("header", True)
                      .option("mode", "PERMISSIVE")
+                     # RFC 4180 doubles quotes inside quoted fields, as Python's
+                     # csv module and the width check expect. Spark's default
+                     # escape is a backslash, which would shift such fields.
+                     .option("escape", '"')
                      .option("columnNameOfCorruptRecord", "_corrupt_record")
                      .option("ignoreLeadingWhiteSpace", False)
                      .option("ignoreTrailingWhiteSpace", False).csv(str(source.path)))
@@ -384,6 +397,15 @@ def clean_flights(raw: DataFrame) -> FlightTables:
         "F_CANCEL_CODE_MISMATCH": (F.col("cancelled") & ~F.coalesce(code.isin("A", "B", "C", "D"), F.lit(False)))
             | ((~F.col("cancelled")) & code.isNotNull()),
         "F_NUMERIC_UNPARSEABLE": reduce(lambda a, b: a | b, minute_invalid + clock_invalid),
+        # Definitional limits, not thresholds: durations and clipped delays cannot
+        # be negative, and a clipped delay is the signed delay floored at zero.
+        "F_MINUTE_DOMAIN": reduce(lambda a, b: a | b, [
+            F.col(c) < 0 for c in NONNEGATIVE_MINUTES
+        ] + [
+            # greatest() skips nulls, so compare only when the signed delay exists.
+            F.col(signed).isNotNull() & (F.col(clipped) != F.greatest(F.col(signed), F.lit(0)))
+            for signed, clipped in CLIPPED_DELAYS
+        ]),
     }
     for severity, output in (("fatal", "rejection_reasons"), ("warning", "quality_flags")):
         frame = frame.withColumn(output, F.filter(F.array(*[
