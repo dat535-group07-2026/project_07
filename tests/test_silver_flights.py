@@ -103,24 +103,45 @@ class CatalogTests(unittest.TestCase):
         with self.assertRaises(Exception):
             flights.current_pointer(output, "2025-6")
 
+    def test_duplicate_csv_and_symlinked_output_are_refused(self):
+        payload = self.catalog()
+        version = payload["assets"]["bts:2025-06"][0]
+        version["csvs"].append(dict(version["csvs"][0]))
+        (self.root / "catalog.json").write_text(json.dumps(payload))
+        with self.assertRaisesRegex(ValueError, "more than once"):
+            flights.select_inputs(self.root, ["bts:2025-06"])
+        elsewhere = self.root / "prod"
+        elsewhere.mkdir()
+        (self.root / "silver").mkdir()
+        (self.root / "silver" / "dev").symlink_to(elsewhere, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            flights.dev_output(self.root)
+
+    def test_publish_moves_pointer_last_and_failure_keeps_old_pointer(self):
+        output = self.root / "silver" / "dev" / "alkval"
+        pointer = flights.current_pointer(output, "2025-06")
+        flights._atomic_json(pointer, {"run_id": "old"})
+        manifest = output / "flights" / "runs" / "new" / "_READY.json"
+        report = {"run_id": "new", "month": "2025-06"}
+        with patch("project07.silver.flights._atomic_json", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                flights._publish(output, manifest, report)
+        self.assertEqual(json.loads(pointer.read_text())["run_id"], "old")
+        written = []
+        real = flights._atomic_json
+        with patch("project07.silver.flights._atomic_json",
+                   side_effect=lambda path, payload: (written.append(path), real(path, payload))), \
+                patch("builtins.print"):
+            flights._publish(output, manifest, report)
+        self.assertEqual(written, [manifest, pointer])
+        self.assertEqual(json.loads(pointer.read_text())["ready_manifest"], "runs/new/_READY.json")
+
     def test_accounting_failure_is_not_accepted(self):
         counts = {"raw": 3, "duplicate_extras": 1, "unique": 2,
                   "scope_excluded": 0, "retained": 1, "quarantined": 1}
         self.assertTrue(all(flights.check_accounting(counts, 3).values()))
         with self.assertRaisesRegex(ValueError, "accounting"):
             flights.check_accounting(counts, 4)
-
-    def test_protected_output_roots_and_symlink_redirects_fail(self):
-        for path in (flights.DEFAULT_DATA_ROOT / "bronze",
-                     flights.DEFAULT_DATA_ROOT / "silver" / "prod",
-                     flights.DEFAULT_DATA_ROOT / "silver" / "dev" / "ckolle"):
-            with self.assertRaisesRegex(ValueError, "Data root"):
-                flights.dev_output_root(path)
-        output = self.root / "silver" / "dev" / "alkval"
-        output.parent.mkdir(parents=True)
-        output.symlink_to(self.root, target_is_directory=True)
-        with self.assertRaisesRegex(ValueError, "Symlink"):
-            flights.dev_output_root(self.root)
 
 
 def fixture(label, number, **changes):

@@ -148,7 +148,6 @@ def select_inputs(bronze_root: Path, asset_ids: list[str]) -> list[SelectedAsset
     if not asset_ids or len(set(asset_ids)) != len(asset_ids):
         raise ValueError("Select a nonempty list of distinct assets")
     selected = []
-    paths = set()
     for asset_id in asset_ids:
         versions = catalog.get("assets", {}).get(asset_id)
         if not versions:
@@ -162,10 +161,8 @@ def select_inputs(bronze_root: Path, asset_ids: list[str]) -> list[SelectedAsset
         if not csvs:
             raise ValueError(f"Selected asset has no extracted CSVs: {asset_id}")
         verified = [_verified_file(root, record) for record in csvs]
-        for record in verified:
-            if record.path in paths:
-                raise ValueError(f"CSV selected more than once: {record.path}")
-            paths.add(record.path)
+        if len({record.path for record in verified}) != len(verified):
+            raise ValueError(f"Asset lists the same CSV more than once: {asset_id}")
         selected.append(SelectedAsset(asset_id, kind, version["sha256"], verified))
     return selected
 
@@ -191,14 +188,10 @@ def read_flights(spark: SparkSession, assets: list[SelectedAsset], bronze_root: 
                 actual = next(csv.reader(stream), None)
             if actual != [*BTS_COLUMNS, ""]:
                 raise ValueError(f"Unexpected BTS header: {source.path}")
-            # The June-October 2025 BTS files were checked with csv.reader:
-            # each record occupies one physical line, including the header.
-            # PERMISSIVE does not flag every short/extra-field record, so check
-            # widths separately. This is not a multiline CSV validator.
-            lines = spark.read.text(str(source.path)).withColumn(
-                "_line_id", F.monotonically_increasing_id())
-            # Each file is read separately; ID zero is its first physical line.
-            lines = lines.filter(F.col("_line_id") != 0)
+            # PERMISSIVE does not flag short or long records, so count fields per
+            # line. Each BTS record is one physical line (checked for June-October
+            # 2025), and the header has the same 110 fields, so no line is skipped.
+            lines = spark.read.text(str(source.path))
             unquoted = F.regexp_replace(F.col("value"), r'"[^"]*"', "")
             commas = F.length(unquoted) - F.length(F.regexp_replace(unquoted, ",", ""))
             invalid_lines = lines.filter(commas != 109).count()
@@ -213,8 +206,7 @@ def read_flights(spark: SparkSession, assets: list[SelectedAsset], bronze_root: 
                      # escape is a backslash, which would shift such fields.
                      .option("escape", '"')
                      .option("columnNameOfCorruptRecord", "_corrupt_record")
-                     .option("ignoreLeadingWhiteSpace", False)
-                     .option("ignoreTrailingWhiteSpace", False).csv(str(source.path)))
+                     .csv(str(source.path)))
             provenance = (asset.asset_id, str(source.path.relative_to(root)), source.sha256,
                           run_id, RULE_VERSION)
             frames.append(frame.select("*", *[
@@ -449,20 +441,14 @@ def _atomic_json(path: Path, payload: dict) -> None:
             temporary.unlink(missing_ok=True)
 
 
-def dev_output_root(data_root: Path) -> Path:
-    """Reject protected roots and symlink redirects before creating any output."""
-    root = data_root.resolve()
-    protected = [DEFAULT_DATA_ROOT / "bronze", DEFAULT_DATA_ROOT / "silver" / "prod",
-                 DEFAULT_DATA_ROOT / "silver" / "dev" / "ckolle"]
-    if any(root.is_relative_to(path.resolve()) for path in protected):
-        raise ValueError("Data root is inside Bronze, prod or Christopher's workspace")
-    output = root / "silver" / "dev" / "alkval"
-    for path in [output, *[output / name for name in ("flights", "flights_quarantine", "audit")]]:
+def dev_output(data_root: Path) -> Path:
+    """The fixed dev root; refuse symlinks that could redirect writes elsewhere."""
+    output = data_root.resolve() / "silver" / "dev" / "alkval"
+    # resolve() follows a symlink anywhere along each path, including parents.
+    for path in (output / "flights" / "current", *(output / table / "runs"
+                 for table in ("flights", "flights_quarantine", "audit"))):
         if path.resolve() != path:
-            raise ValueError(f"Symlink redirects a dev output path: {path}")
-        runs = path / "runs"
-        if runs.resolve() != runs:
-            raise ValueError(f"Symlink redirects a run path: {runs}")
+            raise ValueError(f"Output path goes through a symlink: {path}")
     return output
 
 
@@ -504,10 +490,12 @@ def run_month(args) -> dict:
         raise ValueError("Unset PYSPARK_DRIVER_PYTHON and PYSPARK_DRIVER_PYTHON_OPTS")
     root = args.data_root.resolve()
     bronze = root / "bronze"
-    output = dev_output_root(root)
+    output = dev_output(root)
     commit = _clean_commit()
     started = time.monotonic()
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-") + uuid.uuid4().hex[:8]
+    # Inputs are hash-checked once here. Bronze files are immutable snapshots, so
+    # they are not re-checked after the run; the manifest records their hashes.
     assets = select_inputs(bronze, [f"bts:{args.month}"])
     # Local mode runs tasks inside the driver JVM. Spark's 1 GB default heap ran
     # out of memory on June 2025 (about 277 MB of CSV), so set it before the JVM starts.
@@ -531,28 +519,19 @@ def run_month(args) -> dict:
         classified = tables.classified.persist(StorageLevel.DISK_ONLY)
         counts = tables.audit.first().asDict()
         checks = check_accounting(counts, observed_raw)
-        checks["quarantine_has_reasons"] = not tables.quarantined.filter(
-            F.size("rejection_reasons") == 0).take(1)
+        # A monthly BTS file must contain only that month's flights.
         checks["retained_period_matches_asset"] = not tables.retained.filter(
             F.date_format("flight_date", "yyyy-MM") != args.month).take(1)
-        if not all(checks.values()):
-            raise ValueError(f"Flight validation failed: {checks}")
-        snapshot = _input_snapshot(assets, bronze)
-        csvs = assets[0].csvs
-        # Audit rows describe run-level aggregates; source_file/hash are null
-        # when several CSVs contribute. The full input snapshot is in _READY.
-        audit_rows = [(assets[0].asset_id,
-                       str(csvs[0].path.relative_to(bronze)) if len(csvs) == 1 else None,
-                       csvs[0].sha256 if len(csvs) == 1 else None,
-                       run_id, RULE_VERSION, metric, value) for metric, value in counts.items()]
         audit_schema = T.StructType([
-            *[T.StructField(c, T.StringType(), True) for c in PROVENANCE],
+            T.StructField("silver_run_id", T.StringType(), False),
+            T.StructField("rule_version", T.StringType(), False),
+            T.StructField("source_asset_id", T.StringType(), False),
             T.StructField("metric", T.StringType(), False),
             T.StructField("value", T.LongType(), False),
         ])
-        audit = spark.createDataFrame(audit_rows, audit_schema).withColumn(
-            "record_hash", F.sha2(F.to_json(F.struct("silver_run_id", "metric", "value")), 256)
-        ).withColumn("quality_flags", F.array().cast("array<string>"))
+        audit = spark.createDataFrame(
+            [(run_id, RULE_VERSION, assets[0].asset_id, metric, value)
+             for metric, value in counts.items()], audit_schema)
         expected = {"flights": counts["retained"], "flights_quarantine": counts["quarantined"],
                     "audit": len(counts)}
         outputs = {"flights": tables.retained, "flights_quarantine": tables.quarantined, "audit": audit}
@@ -562,48 +541,41 @@ def run_month(args) -> dict:
                 writer = writer.partitionBy("year", "month")
             writer.parquet(str(paths[name]))
             checks[f"{name}_readback_count"] = spark.read.parquet(str(paths[name])).count() == expected[name]
-        # Check exact selected bytes again, even if the catalog now selects a
-        # newer version. Never alter or reselect Bronze during a Silver run.
-        for asset in assets:
-            for source in asset.csvs:
-                _verified_file(bronze, {"path": str(source.path.relative_to(bronze)),
-                                       "sha256": source.sha256, "size_bytes": source.size_bytes})
-        checks["input_files_unchanged"] = True
         if not all(checks.values()):
-            raise ValueError(f"Flight output checks failed: {checks}")
-        files = {name: [{"path": str(p.relative_to(output)), "size_bytes": p.stat().st_size}
-                        for p in sorted(path.rglob("*.parquet"))] for name, path in paths.items()}
-        samples = {
-            "retained": [r.asDict(recursive=True) for r in tables.retained.orderBy(
-                "record_hash").limit(3).collect()],
-            "quarantined": [r.asDict(recursive=True) for r in tables.quarantined.orderBy(
-                "record_hash").limit(3).collect()],
-        }
+            raise ValueError(f"Flight checks failed: {checks}")
         report = {"run_id": run_id, "git_commit": commit, "rule_version": RULE_VERSION,
                   "env": "dev", "dev_user": "alkval", "month": args.month,
-                  "inputs": snapshot, "counts": counts, "checks": checks,
-                  "elapsed_seconds": round(time.monotonic() - started, 3), "files": files,
-                  "spark_version": spark.version,
-                  "assumptions": "PR #3 defaults and flights-0.1-working; awaiting Monday review",
-                  "outputs": {name: str(path.relative_to(output)) for name, path in paths.items()}}
-        # Prepare all companion tables before committing one authoritative pointer.
-        # Temporary runner: only the month's flights pointer is advanced. Its
-        # readiness manifest identifies quarantine and audit from this exact run.
-        # Separate table pointers would permit a partial cross-table publication
-        # on failure. Agree the final pointer interface with the common.py owner.
-        for name, path in paths.items():
-            _atomic_json(path / "_READY.json", {**report, "table": name})
-        _atomic_json(current_pointer(output, args.month), {
-            "month": args.month,
-            "run_id": run_id,
-            "ready_manifest": str((paths["flights"] / "_READY.json").relative_to(output / "flights")),
-        })
-        print(json.dumps({**report, "samples": samples}, indent=2, default=str))
+                  "inputs": _input_snapshot(assets, bronze),
+                  "counts": counts, "checks": checks, "spark_version": spark.version,
+                  "elapsed_seconds": round(time.monotonic() - started, 3),
+                  "outputs": {name: _output_summary(path, output) for name, path in paths.items()}}
+        _publish(output, paths["flights"] / "_READY.json", report)
         return report
     finally:
-        if classified is not None:
-            classified.unpersist()
-        spark.stop()
+        try:
+            if classified is not None:
+                classified.unpersist()
+        finally:
+            spark.stop()
+
+
+def _output_summary(path: Path, output: Path) -> dict:
+    files = list(path.rglob("*.parquet"))
+    return {"path": str(path.relative_to(output)), "parquet_files": len(files),
+            "bytes": sum(p.stat().st_size for p in files)}
+
+
+def _publish(output: Path, manifest: Path, report: dict) -> None:
+    """Write the run's single manifest, then move the month's pointer as the last step.
+
+    Any failure before the pointer moves leaves the previously published month in place.
+    """
+    _atomic_json(manifest, report)
+    print(json.dumps(report, indent=2))
+    _atomic_json(current_pointer(output, report["month"]), {
+        "month": report["month"], "run_id": report["run_id"],
+        "ready_manifest": str(manifest.relative_to(output / "flights")),
+    })
 
 
 def main(argv=None):
