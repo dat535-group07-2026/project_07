@@ -33,13 +33,15 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(prod_cfg.silver_root, self.root / "silver" / "prod")
         self.assertEqual(prod_cfg.gold_root, self.root / "gold" / "prod")
 
-    def test_dev_user_defaults_to_env_and_prod_rejects_dev_user(self) -> None:
-        with patch.dict(os.environ, {"USER": "testuser"}):
-            cfg = config.resolve_config(env="dev", data_root=self.root)
-            self.assertEqual(cfg.dev_user, "testuser")
+    def test_dev_requires_explicit_dev_user_and_prod_rejects_dev_user(self) -> None:
+        with self.assertRaisesRegex(ValueError, "--dev-user is required"):
+            config.resolve_config(env="dev", data_root=self.root)
+
+        with self.assertRaisesRegex(ValueError, "ubuntu"):
+            config.resolve_config(env="dev", data_root=self.root, dev_user="ubuntu")
 
         with self.assertRaisesRegex(ValueError, "dev-user"):
-            config.resolve_config(env="prod", data_root=self.root, dev_user="christopher")
+            config.resolve_config(env="prod", data_root=self.root, dev_user="ckolle")
 
         with self.assertRaisesRegex(ValueError, "Invalid dev_user"):
             config.resolve_config(env="dev", data_root=self.root, dev_user="../escape")

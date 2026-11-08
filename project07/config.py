@@ -43,10 +43,12 @@ class PipelineConfig:
             raise ValueError(f"Data root goes through a symlink: {self.data_root}")
         object.__setattr__(self, "data_root", resolved_root)
         if self.env == "dev":
-            user = self.dev_user or os.environ.get("USER") or ""
-            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", user):
-                raise ValueError(f"Invalid dev_user {user!r}; provide a safe identifier")
-            object.__setattr__(self, "dev_user", user)
+            if not self.dev_user:
+                raise ValueError("--dev-user is required when --env dev is selected")
+            if self.dev_user == "ubuntu":
+                raise ValueError("Do not use shared VM account 'ubuntu' as --dev-user")
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", self.dev_user):
+                raise ValueError(f"Invalid dev_user {self.dev_user!r}; provide a safe identifier")
         else:
             if self.dev_user is not None:
                 raise ValueError("Do not specify --dev-user when --env prod is selected")
@@ -107,6 +109,6 @@ def add_config_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--dev-user",
         default=None,
-        help="Developer namespace for --env dev (defaults to $USER).",
+        help="Developer namespace required when --env dev is used (e.g. ckolle or alkval).",
     )
 
