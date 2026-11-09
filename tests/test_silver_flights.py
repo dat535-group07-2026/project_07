@@ -7,141 +7,22 @@ import tempfile
 import unittest
 from datetime import date, datetime
 from pathlib import Path
-from unittest.mock import patch
 
-from project07.silver import flights
+from project07.silver import common, flights
 
 
-class CatalogTests(unittest.TestCase):
-    def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
-        self.archive = self.root / "archive.zip"
-        self.archive.write_bytes(b"archive fixture, not opened by the catalog reader")
-        self.csv = self.root / "flights.csv"
-        self.csv.write_bytes(b"fixture bytes")
-
-    def record(self, path):
-        return {"path": path.name, "sha256": flights.file_hash(path),
-                "size_bytes": path.stat().st_size}
-
-    def catalog(self, version=None):
-        version = version or {**self.record(self.archive), "kind": "bts",
-                              "csvs": [self.record(self.csv)]}
-        payload = {"schema_version": 1, "assets": {"bts:2025-06": [version]}}
-        (self.root / "catalog.json").write_text(json.dumps(payload))
-        return payload
-
-    def test_selected_asset_signature_and_original_files_unchanged(self):
-        self.catalog()
-        before = {p: p.read_bytes() for p in (self.csv, self.archive, self.root / "catalog.json")}
-        selected = flights.select_inputs(self.root, ["bts:2025-06"])[0]
-        self.assertEqual(selected.asset_id, "bts:2025-06")
-        self.assertEqual(selected.kind, "bts")
-        self.assertEqual(selected.version_sha256, flights.file_hash(self.archive))
-        self.assertEqual(selected.csvs, [flights.SelectedCsv(
-            self.csv.resolve(), flights.file_hash(self.csv), self.csv.stat().st_size)])
-        for path, content in before.items():
-            self.assertEqual(path.read_bytes(), content)
-
-    def test_last_version_is_selected(self):
-        payload = self.catalog()
-        other = self.root / "revised.csv"
-        other.write_bytes(b"new version")
-        payload["assets"]["bts:2025-06"].append({**payload["assets"]["bts:2025-06"][0],
-                                                 "csvs": [self.record(other)]})
-        (self.root / "catalog.json").write_text(json.dumps(payload))
-        self.assertEqual(flights.select_inputs(self.root, ["bts:2025-06"])[0].csvs[0].path, other.resolve())
-
-    def test_missing_asset_and_unknown_schema_fail(self):
-        payload = self.catalog()
-        with self.assertRaisesRegex(ValueError, "Missing Bronze asset"):
-            flights.select_inputs(self.root, ["bts:2025-07"])
-        payload["schema_version"] = 2
-        (self.root / "catalog.json").write_text(json.dumps(payload))
-        with self.assertRaisesRegex(ValueError, "schema"):
-            flights.select_inputs(self.root, ["bts:2025-06"])
-
-    def test_checksum_and_size_mismatch_fail(self):
-        self.catalog()
-        self.csv.write_bytes(b"bad")
-        with self.assertRaisesRegex(ValueError, "mismatch"):
-            flights.select_inputs(self.root, ["bts:2025-06"])
-        self.catalog()
-        self.csv.write_bytes(b"BAD")
-        with self.assertRaisesRegex(ValueError, "mismatch"):
-            flights.select_inputs(self.root, ["bts:2025-06"])
-
-    def test_unsafe_paths_and_duplicate_selection_fail(self):
-        payload = self.catalog()
-        payload["assets"]["bts:2025-06"][0]["csvs"][0]["path"] = "../outside.csv"
-        (self.root / "catalog.json").write_text(json.dumps(payload))
-        with self.assertRaisesRegex(ValueError, "Unsafe"):
-            flights.select_inputs(self.root, ["bts:2025-06"])
-        with self.assertRaisesRegex(ValueError, "distinct"):
-            flights.select_inputs(self.root, ["bts:2025-06", "bts:2025-06"])
-
-    def test_failed_atomic_pointer_replacement_preserves_previous_value(self):
-        pointer = self.root / "current.json"
-        flights._atomic_json(pointer, {"run_id": "old"})
-        with patch("project07.silver.flights.os.replace", side_effect=OSError("fixture failure")):
-            with self.assertRaises(OSError):
-                flights._atomic_json(pointer, {"run_id": "new"})
-        self.assertEqual(json.loads(pointer.read_text()), {"run_id": "old"})
-        self.assertEqual(sorted(p.name for p in self.root.iterdir()),
-                         ["archive.zip", "current.json", "flights.csv"])
-
+class MonthlyPointerTests(unittest.TestCase):
     def test_publishing_one_month_keeps_other_months_current(self):
-        output = self.root / "silver" / "dev" / "alkval"
-        june, july = (flights.current_pointer(output, m) for m in ("2025-06", "2025-07"))
-        self.assertEqual(june, output / "flights" / "current" / "2025-06.json")
-        flights._atomic_json(june, {"month": "2025-06", "run_id": "june-run"})
-        flights._atomic_json(july, {"month": "2025-07", "run_id": "july-run"})
-        self.assertEqual(json.loads(june.read_text())["run_id"], "june-run")
-        self.assertEqual(json.loads(july.read_text())["run_id"], "july-run")
-        with self.assertRaises(Exception):
-            flights.current_pointer(output, "2025-6")
-
-    def test_duplicate_csv_and_symlinked_output_are_refused(self):
-        payload = self.catalog()
-        version = payload["assets"]["bts:2025-06"][0]
-        version["csvs"].append(dict(version["csvs"][0]))
-        (self.root / "catalog.json").write_text(json.dumps(payload))
-        with self.assertRaisesRegex(ValueError, "more than once"):
-            flights.select_inputs(self.root, ["bts:2025-06"])
-        elsewhere = self.root / "prod"
-        elsewhere.mkdir()
-        (self.root / "silver").mkdir()
-        (self.root / "silver" / "dev").symlink_to(elsewhere, target_is_directory=True)
-        with self.assertRaisesRegex(ValueError, "symlink"):
-            flights.dev_output(self.root)
-
-    def test_publish_moves_pointer_last_and_failure_keeps_old_pointer(self):
-        output = self.root / "silver" / "dev" / "alkval"
-        pointer = flights.current_pointer(output, "2025-06")
-        flights._atomic_json(pointer, {"run_id": "old"})
-        manifest = output / "flights" / "runs" / "new" / "_READY.json"
-        report = {"run_id": "new", "month": "2025-06"}
-        with patch("project07.silver.flights._atomic_json", side_effect=OSError("disk full")):
-            with self.assertRaises(OSError):
-                flights._publish(output, manifest, report)
-        self.assertEqual(json.loads(pointer.read_text())["run_id"], "old")
-        written = []
-        real = flights._atomic_json
-        with patch("project07.silver.flights._atomic_json",
-                   side_effect=lambda path, payload: (written.append(path), real(path, payload))), \
-                patch("builtins.print"):
-            flights._publish(output, manifest, report)
-        self.assertEqual(written, [manifest, pointer])
-        self.assertEqual(json.loads(pointer.read_text())["ready_manifest"], "runs/new/_READY.json")
-
-    def test_accounting_failure_is_not_accepted(self):
-        counts = {"raw": 3, "duplicate_extras": 1, "unique": 2,
-                  "scope_excluded": 0, "retained": 1, "quarantined": 1}
-        self.assertTrue(all(flights.check_accounting(counts, 3).values()))
-        with self.assertRaisesRegex(ValueError, "accounting"):
-            flights.check_accounting(counts, 4)
+        with tempfile.TemporaryDirectory() as directory:
+            silver_root = Path(directory) / "silver" / "dev" / "alkval"
+            for month in ("2025-06", "2025-07"):
+                manifest = silver_root / "flights" / "runs" / f"run-{month}" / "_READY.json"
+                common.publish_ready(silver_root, "flights", manifest, {"run_id": f"run-{month}"},
+                                     pointer_key=month)
+            june, july = (common.current_pointer(silver_root, "flights", m) for m in ("2025-06", "2025-07"))
+            self.assertEqual(june, silver_root / "flights" / "current" / "2025-06.json")
+            self.assertEqual(json.loads(june.read_text())["run_id"], "run-2025-06")
+            self.assertEqual(json.loads(july.read_text())["run_id"], "run-2025-07")
 
 
 def fixture(label, number, **changes):
@@ -364,7 +245,7 @@ class FlightSparkTests(unittest.TestCase):
         self.assertEqual(self.counts["F_FLAG_INVALID"], 2)
 
     def test_every_fixture_has_a_defined_outcome_and_counts_reconcile(self):
-        self.assertTrue(all(flights.check_accounting(self.counts, len(self.fixture_rows)).values()))
+        self.assertTrue(all(common.check_accounting(self.counts, len(self.fixture_rows)).values()))
         self.assertEqual(self.counts["unique"], len(self.records))
         self.assertEqual(self.counts["scope_excluded"], 0)
         for row in self.records:
@@ -387,8 +268,8 @@ class FlightSparkTests(unittest.TestCase):
             writer.writerow([*flights.BTS_COLUMNS, ""])
             writer.writerow([row[name] for name in (*flights.BTS_COLUMNS, "_trailing_empty")])
             path.write_text(buffer.getvalue())
-            source = flights.SelectedCsv(path, flights.file_hash(path), path.stat().st_size)
-            asset = flights.SelectedAsset("bts:2025-06", "bts", "a" * 64, [source])
+            source = common.SelectedCsv(path, common.file_hash(path), path.stat().st_size)
+            asset = common.SelectedAsset("bts:2025-06", "bts", "a" * 64, [source])
             frame = flights.read_flights(self.spark, [asset], root, "reader-test")
             actual = frame.first()
             self.assertEqual(actual.OriginCityName, "New York, NY")
@@ -406,8 +287,8 @@ class FlightSparkTests(unittest.TestCase):
             writer.writerow([*flights.BTS_COLUMNS, ""])
             writer.writerow([row[name] for name in (*flights.BTS_COLUMNS, "_trailing_empty")])
             path.write_text(buffer.getvalue())
-            source = flights.SelectedCsv(path, flights.file_hash(path), path.stat().st_size)
-            asset = flights.SelectedAsset("bts:2025-06", "bts", "a" * 64, [source])
+            source = common.SelectedCsv(path, common.file_hash(path), path.stat().st_size)
+            asset = common.SelectedAsset("bts:2025-06", "bts", "a" * 64, [source])
             actual = flights.read_flights(self.spark, [asset], root, "quote-test").first()
             self.assertEqual(actual.OriginCityName, 'Say "Hi", NY')
             self.assertEqual((actual.Origin, actual.Dest, actual.CRSDepTime), ("JFK", "LGA", "1000"))
@@ -427,8 +308,8 @@ class FlightSparkTests(unittest.TestCase):
             writer.writerow(values[:-1])
             writer.writerow([*values, "extra"])
             path.write_text(buffer.getvalue())
-            source = flights.SelectedCsv(path, flights.file_hash(path), path.stat().st_size)
-            asset = flights.SelectedAsset("bts:2025-06", "bts", "a" * 64, [source])
+            source = common.SelectedCsv(path, common.file_hash(path), path.stat().st_size)
+            asset = common.SelectedAsset("bts:2025-06", "bts", "a" * 64, [source])
             with self.assertRaisesRegex(ValueError, "2 lines deviate from 110 fields"):
                 flights.read_flights(self.spark, [asset], root, "width-test")
 

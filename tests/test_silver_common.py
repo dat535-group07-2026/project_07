@@ -197,6 +197,23 @@ class CatalogAndPublicationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unsafe"):
             common.select_inputs(self.root, ["noaa:USW00094789:2025"])
 
+    def test_select_inputs_rejects_the_same_csv_listed_twice(self) -> None:
+        payload = self._write_catalog()
+        version = payload["assets"]["bts:2025-06"][0]
+        version["csvs"].append(dict(version["csvs"][0]))
+        self._write_catalog(payload)
+        with self.assertRaisesRegex(ValueError, "more than once"):
+            common.select_inputs(self.root, ["bts:2025-06"])
+
+    def test_failed_atomic_replace_keeps_the_old_file_and_no_temporary_file(self) -> None:
+        pointer = self.root / "pointers" / "current.json"
+        common.atomic_json(pointer, {"run_id": "old"})
+        with patch("project07.silver.common.os.replace", side_effect=OSError("disk error")):
+            with self.assertRaises(OSError):
+                common.atomic_json(pointer, {"run_id": "new"})
+        self.assertEqual(json.loads(pointer.read_text(encoding="utf-8")), {"run_id": "old"})
+        self.assertEqual([p.name for p in pointer.parent.iterdir()], ["current.json"])
+
     def test_check_accounting_enforces_both_equations(self) -> None:
         valid = {
             "raw": 10,
