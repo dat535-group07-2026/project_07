@@ -1,2 +1,5 @@
 # Project Spark dependency; align the VM environment before running Silver.
 pyspark==3.5.0
+
+# Static Gold consumer figures (Python 3.11).
+matplotlib==3.10.8
