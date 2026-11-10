@@ -1,43 +1,29 @@
-"""First national BTS flight slice, using PR #3's working assumptions.
+"""BTS On-Time Performance Silver cleaner for the national monthly flight files.
 
-The severities below are proposals for Monday's meeting, not BTS requirements.
 The BTS directive defines the clocks, minute fields and operational states:
 https://www.bts.gov/topics/airlines-and-airports/number-31-technical-directive-time-reporting-effective-jan-1-2019
+The rule severities are our own choices, not BTS requirements.
 
-Only this module contains temporary catalog/runtime/publication adapters. Replace
-them with Christopher's shared implementations when their interfaces are ready.
-No national time zone is assigned. Local datetimes use Spark TIMESTAMP_NTZ.
+No time zone is assigned here, because the file covers every US airport.
+Local datetimes use Spark TIMESTAMP_NTZ. Reading the catalog, running and
+publishing are in common.py and run.py.
 """
 
 from __future__ import annotations
 
-import argparse
-import csv
-import hashlib
-import json
-import logging
-import os
-import re
-import subprocess
-import tempfile
-import time
-import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from functools import reduce
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Sequence
+
+from project07.silver import common
 
 if TYPE_CHECKING:
     from pyspark.sql import DataFrame, SparkSession
 
 
-LOG = logging.getLogger(__name__)
-DEFAULT_DATA_ROOT = Path("/home/ubuntu/project-data")
 RULE_VERSION = "flights-0.2-working"
-PROVENANCE = (
-    "source_asset_id", "source_file", "source_sha256", "silver_run_id", "rule_version",
-)
+PROVENANCE = common.PROVENANCE
 KEY_FIELDS = (
     "FlightDate", "Reporting_Airline", "Flight_Number_Reporting_Airline",
     "Origin", "Dest", "CRSDepTime",
@@ -103,118 +89,21 @@ CLIPPED_DELAYS = (
 )
 
 
-# Temporary common.select_inputs stand-in. Keep the PR #3 dataclass signature.
-@dataclass(frozen=True)
-class SelectedCsv:
-    path: Path
-    sha256: str
-    size_bytes: int
-
-
-@dataclass(frozen=True)
-class SelectedAsset:
-    asset_id: str
-    kind: str
-    version_sha256: str
-    csvs: list[SelectedCsv]
-
-
-def file_hash(path: Path) -> str:
-    with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
-
-
-def _verified_file(root: Path, record: dict) -> SelectedCsv:
-    relative = Path(record["path"])
-    if relative.is_absolute() or ".." in relative.parts:
-        raise ValueError(f"Unsafe catalog path: {relative}")
-    path = (root / relative).resolve()
-    if not path.is_relative_to(root) or not path.is_file():
-        raise ValueError(f"Missing file or path outside Bronze: {relative}")
-    digest = record["sha256"]
-    if not re.fullmatch(r"[0-9a-f]{64}", digest):
-        raise ValueError(f"Invalid catalog checksum: {relative}")
-    if path.stat().st_size != record["size_bytes"] or file_hash(path) != digest:
-        raise ValueError(f"Catalog size/checksum mismatch: {relative}")
-    return SelectedCsv(path, digest, record["size_bytes"])
-
-
-def select_inputs(bronze_root: Path, asset_ids: list[str]) -> list[SelectedAsset]:
-    """Read one catalog snapshot; verify selected source and extracted files."""
-    root = Path(bronze_root).resolve()
-    catalog = json.loads((root / "catalog.json").read_text(encoding="utf-8"))
-    if catalog.get("schema_version") != 1:
-        raise ValueError("Unsupported Bronze catalog schema")
-    if not asset_ids or len(set(asset_ids)) != len(asset_ids):
-        raise ValueError("Select a nonempty list of distinct assets")
-    selected = []
-    for asset_id in asset_ids:
-        versions = catalog.get("assets", {}).get(asset_id)
-        if not versions:
-            raise ValueError(f"Missing Bronze asset: {asset_id}")
-        version = versions[-1]
-        kind = version.get("kind")
-        if kind not in {"bts", "noaa"} or asset_id.split(":", 1)[0] != kind:
-            raise ValueError(f"Unexpected asset kind: {asset_id}")
-        _verified_file(root, version)
-        csvs = version.get("csvs", []) if kind == "bts" else [version]
-        if not csvs:
-            raise ValueError(f"Selected asset has no extracted CSVs: {asset_id}")
-        verified = [_verified_file(root, record) for record in csvs]
-        if len({record.path for record in verified}) != len(verified):
-            raise ValueError(f"Asset lists the same CSV more than once: {asset_id}")
-        selected.append(SelectedAsset(asset_id, kind, version["sha256"], verified))
-    return selected
-
-
 def raw_schema():
-    from pyspark.sql.types import StringType, StructField, StructType
+    """Return the explicit all-string schema for the BTS CSV."""
+    return common.raw_string_schema(RAW_FIELDS)
 
-    return StructType([StructField(name, StringType(), True) for name in RAW_FIELDS])
 
-
-# Temporary raw-reader adapter; move into common.py after Christopher's PR.
-def read_flights(spark: SparkSession, assets: list[SelectedAsset], bronze_root: Path,
+def read_flights(spark: SparkSession, assets: Sequence[common.SelectedAsset], bronze_root: Path,
                  run_id: str) -> DataFrame:
-    from pyspark.sql import functions as F
+    """Read verified BTS CSVs from Bronze as text and attach the provenance columns.
 
-    frames = []
-    root = Path(bronze_root).resolve()
-    for asset in assets:
-        if asset.kind != "bts":
-            raise ValueError("The flight reader accepts only BTS assets")
-        for source in asset.csvs:
-            with source.path.open(encoding="utf-8-sig", newline="") as stream:
-                actual = next(csv.reader(stream), None)
-            if actual != [*BTS_COLUMNS, ""]:
-                raise ValueError(f"Unexpected BTS header: {source.path}")
-            # PERMISSIVE does not flag short or long records, so count fields per
-            # line. Each BTS record is one physical line (checked for June-October
-            # 2025), and the header has the same 110 fields, so no line is skipped.
-            lines = spark.read.text(str(source.path))
-            unquoted = F.regexp_replace(F.col("value"), r'"[^"]*"', "")
-            commas = F.length(unquoted) - F.length(F.regexp_replace(unquoted, ",", ""))
-            invalid_lines = lines.filter(commas != 109).count()
-            if invalid_lines:
-                raise ValueError(
-                    f"BTS CSV field count: {invalid_lines} lines deviate from "
-                    f"110 fields (109 commas): {source.path}")
-            frame = (spark.read.schema(raw_schema()).option("header", True)
-                     .option("mode", "PERMISSIVE")
-                     # RFC 4180 doubles quotes inside quoted fields, as Python's
-                     # csv module and the width check expect. Spark's default
-                     # escape is a backslash, which would shift such fields.
-                     .option("escape", '"')
-                     .option("columnNameOfCorruptRecord", "_corrupt_record")
-                     .csv(str(source.path)))
-            provenance = (asset.asset_id, str(source.path.relative_to(root)), source.sha256,
-                          run_id, RULE_VERSION)
-            frames.append(frame.select("*", *[
-                F.lit(value).alias(name) for name, value in zip(PROVENANCE, provenance)
-            ]))
-    if not frames:
-        raise ValueError("No flight CSVs selected")
-    return reduce(lambda left, right: left.unionByName(right), frames)
+    Each BTS line ends with a comma, so the header has an empty 110th field.
+    """
+    return common.read_raw_csvs(
+        spark, assets, bronze_root, run_id=run_id, rule_version=RULE_VERSION,
+        columns=BTS_COLUMNS, expected_kind="bts", trailing_empty=True,
+    )
 
 
 def _token(name):
@@ -287,29 +176,13 @@ def clean_flights(raw: DataFrame) -> FlightTables:
     Policy assumptions: two alphanumeric reporting-carrier characters, one to
     four flight-number digits (not all zero), three-letter airport codes and
     integral minute values. These are format checks, not reference-data lookups.
-    This slice has no scope exclusions. No valid airport is filtered out.
+    There are no scope exclusions, so no valid airport is filtered out.
     """
     from pyspark.sql import Window, functions as F
 
-    required = set(RAW_FIELDS) | set(PROVENANCE)
-    if required - set(raw.columns):
-        raise ValueError(f"Raw columns missing: {sorted(required - set(raw.columns))}")
-    if raw.sparkSession.conf.get("spark.sql.ansi.enabled").lower() != "false":
-        raise ValueError("Flight parsing requires explicit ANSI=false")
-    if raw.sparkSession.conf.get("spark.sql.session.timeZone") != "UTC":
-        raise ValueError("Flight tests and runner require explicit session timeZone=UTC")
-
-    # Group on the complete raw struct, not on its hash or a pruned column set.
-    # Choose provenance deterministically if identical rows occur in several files.
-    frame = raw.select(
-        F.struct(*[F.col(c) for c in RAW_FIELDS]).alias("original"),
-        F.struct(*[F.col(c) for c in PROVENANCE]).alias("_provenance"),
-    ).groupBy("original").agg(
-        F.count("*").alias("_occurrences"), F.min("_provenance").alias("_provenance"),
-    ).select("original", "original.*", "_occurrences", "_provenance.*")
-    frame = frame.withColumn("record_hash", F.sha2(
-        F.to_json("original", {"ignoreNullFields": "false"}), 256))
-    # JSON null is a fixed encoding distinct from the literal string "null".
+    # Exact duplicates are grouped on the complete raw row, not on a hash or a
+    # pruned column set. This also checks the ANSI and time zone settings.
+    frame = common.deduplicate_with_provenance(raw, RAW_FIELDS)
     frame = frame.withColumn("flight_date", F.when(
         _token("FlightDate").rlike(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"),
         F.to_date(_token("FlightDate"), "yyyy-MM-dd")))
@@ -413,186 +286,3 @@ def clean_flights(raw: DataFrame) -> FlightTables:
         "actual_dep_local", "dep_day_offset", "year", "month", "quality_flags",
         "rejection_reasons", "outcome", "original", "_occurrences",
     ))
-
-
-def check_accounting(counts: dict, observed_raw: int) -> dict:
-    checks = {
-        "raw_matches_reader": counts["raw"] == observed_raw,
-        "raw_reconciles": counts["raw"] == counts["duplicate_extras"] + counts["unique"],
-        "unique_reconciles": counts["unique"] == counts["scope_excluded"] + counts["retained"] + counts["quarantined"],
-    }
-    if not all(checks.values()):
-        raise ValueError(f"Flight row accounting failed: {checks}")
-    return checks
-
-
-# Temporary publication helpers. No overwrites of immutable runs or other roots.
-def _atomic_json(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile("w", dir=path.parent, encoding="utf-8", delete=False) as stream:
-            temporary = Path(stream.name)
-            json.dump(payload, stream, indent=2)
-            stream.write("\n")
-        os.replace(temporary, path)
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-
-
-def dev_output(data_root: Path) -> Path:
-    """The fixed dev root; refuse symlinks that could redirect writes elsewhere."""
-    output = data_root.resolve() / "silver" / "dev" / "alkval"
-    # resolve() follows a symlink anywhere along each path, including parents.
-    for path in (output / "flights" / "current", *(output / table / "runs"
-                 for table in ("flights", "flights_quarantine", "audit"))):
-        if path.resolve() != path:
-            raise ValueError(f"Output path goes through a symlink: {path}")
-    return output
-
-
-def current_pointer(output: Path, month: str) -> Path:
-    """One pointer per source month, so publishing one month leaves the others current."""
-    return output / "flights" / "current" / f"{_month(month)}.json"
-
-
-def _input_snapshot(assets, root):
-    return [{"asset_id": a.asset_id, "kind": a.kind, "version_sha256": a.version_sha256,
-             "csvs": [{"path": str(c.path.relative_to(root)), "sha256": c.sha256,
-                       "size_bytes": c.size_bytes} for c in a.csvs]} for a in assets]
-
-
-def _clean_commit() -> str:
-    repository = Path(__file__).resolve().parents[2]
-    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repository, text=True).strip()
-    if subprocess.check_output(["git", "status", "--porcelain"], cwd=repository, text=True).strip():
-        raise ValueError("Publish from a clean committed checkout so the manifest identifies the code")
-    return commit
-
-
-def _month(value):
-    if not re.fullmatch(r"[0-9]{4}-(?:0[1-9]|1[0-2])", value):
-        raise argparse.ArgumentTypeError("Use YYYY-MM")
-    return value
-
-
-def run_month(args) -> dict:
-    """Temporary dev-only entry point; shared run.py will replace this adapter."""
-    from pyspark import StorageLevel
-    from pyspark.sql import SparkSession, functions as F, types as T
-
-    if args.env != "dev" or args.dev_user != "alkval":
-        raise ValueError("This temporary flight runner only writes --env dev --dev-user alkval")
-    if Path(os.environ.get("JAVA_HOME", "")).resolve() != Path("/usr/lib/jvm/java-8-openjdk-amd64").resolve():
-        raise ValueError("Set JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64")
-    if os.environ.get("PYSPARK_DRIVER_PYTHON") or os.environ.get("PYSPARK_DRIVER_PYTHON_OPTS"):
-        raise ValueError("Unset PYSPARK_DRIVER_PYTHON and PYSPARK_DRIVER_PYTHON_OPTS")
-    root = args.data_root.resolve()
-    bronze = root / "bronze"
-    output = dev_output(root)
-    commit = _clean_commit()
-    started = time.monotonic()
-    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-") + uuid.uuid4().hex[:8]
-    # Inputs are hash-checked once here. Bronze files are immutable snapshots, so
-    # they are not re-checked after the run; the manifest records their hashes.
-    assets = select_inputs(bronze, [f"bts:{args.month}"])
-    # Local mode runs tasks inside the driver JVM. Spark's 1 GB default heap ran
-    # out of memory on June 2025 (about 277 MB of CSV), so set it before the JVM starts.
-    spark = (SparkSession.builder.master("local[*]").appName(f"project07-flights-{args.month}")
-             .config("spark.driver.memory", "3g")
-             .config("spark.sql.session.timeZone", "UTC")
-             .config("spark.sql.ansi.enabled", "false")
-             .config("spark.ui.enabled", "false").getOrCreate())
-    spark.sparkContext.setLogLevel("WARN")
-    classified = None
-    paths = {table: output / table / "runs" / run_id
-             for table in ("flights", "flights_quarantine", "audit")}
-    try:
-        # The raw rows are read twice (one count, one classification) instead of
-        # cached. The classified rows are reused by the audit, checks and three
-        # writes, so they are cached on disk: building in-memory columnar batches
-        # of the wide original struct exhausted the heap.
-        raw = read_flights(spark, assets, bronze, run_id)
-        observed_raw = raw.count()
-        tables = clean_flights(raw)
-        classified = tables.classified.persist(StorageLevel.DISK_ONLY)
-        counts = tables.audit.first().asDict()
-        checks = check_accounting(counts, observed_raw)
-        # A monthly BTS file must contain only that month's flights.
-        checks["retained_period_matches_asset"] = not tables.retained.filter(
-            F.date_format("flight_date", "yyyy-MM") != args.month).take(1)
-        audit_schema = T.StructType([
-            T.StructField("silver_run_id", T.StringType(), False),
-            T.StructField("rule_version", T.StringType(), False),
-            T.StructField("source_asset_id", T.StringType(), False),
-            T.StructField("metric", T.StringType(), False),
-            T.StructField("value", T.LongType(), False),
-        ])
-        audit = spark.createDataFrame(
-            [(run_id, RULE_VERSION, assets[0].asset_id, metric, value)
-             for metric, value in counts.items()], audit_schema)
-        expected = {"flights": counts["retained"], "flights_quarantine": counts["quarantined"],
-                    "audit": len(counts)}
-        outputs = {"flights": tables.retained, "flights_quarantine": tables.quarantined, "audit": audit}
-        for name, frame in outputs.items():
-            writer = frame.write.mode("errorifexists")
-            if name == "flights" and expected[name]:
-                writer = writer.partitionBy("year", "month")
-            writer.parquet(str(paths[name]))
-            checks[f"{name}_readback_count"] = spark.read.parquet(str(paths[name])).count() == expected[name]
-        if not all(checks.values()):
-            raise ValueError(f"Flight checks failed: {checks}")
-        report = {"run_id": run_id, "git_commit": commit, "rule_version": RULE_VERSION,
-                  "env": "dev", "dev_user": "alkval", "month": args.month,
-                  "inputs": _input_snapshot(assets, bronze),
-                  "counts": counts, "checks": checks, "spark_version": spark.version,
-                  "elapsed_seconds": round(time.monotonic() - started, 3),
-                  "outputs": {name: _output_summary(path, output) for name, path in paths.items()}}
-        _publish(output, paths["flights"] / "_READY.json", report)
-        return report
-    finally:
-        try:
-            if classified is not None:
-                classified.unpersist()
-        finally:
-            spark.stop()
-
-
-def _output_summary(path: Path, output: Path) -> dict:
-    files = list(path.rglob("*.parquet"))
-    return {"path": str(path.relative_to(output)), "parquet_files": len(files),
-            "bytes": sum(p.stat().st_size for p in files)}
-
-
-def _publish(output: Path, manifest: Path, report: dict) -> None:
-    """Write the run's single manifest, then move the month's pointer as the last step.
-
-    Any failure before the pointer moves leaves the previously published month in place.
-    """
-    _atomic_json(manifest, report)
-    print(json.dumps(report, indent=2))
-    _atomic_json(current_pointer(output, report["month"]), {
-        "month": report["month"], "run_id": report["run_id"],
-        "ready_manifest": str(manifest.relative_to(output / "flights")),
-    })
-
-
-def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--month", required=True, type=_month)
-    parser.add_argument("--env", required=True, choices=["dev"])
-    parser.add_argument("--dev-user", required=True, choices=["alkval"])
-    parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
-    args = parser.parse_args(argv)
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    try:
-        run_month(args)
-    except Exception:
-        LOG.exception("Flight slice failed; inspect any incomplete run directories")
-        return 1
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
