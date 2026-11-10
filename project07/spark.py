@@ -69,6 +69,8 @@ def get_spark(
     if env == "test":
         builder = builder.config("spark.sql.shuffle.partitions", "2")
     else:
+        # June benchmark: 8 shuffle partitions cut the measured median from 46.9s to 43.0s on the 4-core VM.
+        builder = builder.config("spark.sql.shuffle.partitions", "8")
         builder = builder.config("spark.driver.memory", driver_memory)
 
     spark = builder.getOrCreate()
