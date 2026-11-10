@@ -277,3 +277,14 @@ The comparison's per-run results and execution plans remain on the VM in
 `/home/ubuntu/dev/alkval/benchmark-flights-baseline.log` and
 `/home/ubuntu/dev/alkval/benchmark-flights-shuffle8.log`. The excluded initial
 baseline is kept separately as `benchmark-flights-baseline-initial.log`.
+
+Full-run check, separate from the benchmark above: on 10 November we also ran
+complete development runs, including output writes and read-back checks, once
+with each setting. With 200 versus eight shuffle partitions, June flights took
+59.744 versus 55.073 seconds and produced seven versus eight flight Parquet
+files. Both retained 611,575 rows, with identical values after excluding
+`silver_run_id`. The following Gold runs took 26.061 versus 22.039 seconds and
+each produced one file with 306 rows, covering 102,640 flights and 99,591
+weather matches. All checks passed. These single runs support keeping eight
+partitions on our VM, but do not establish a repeatable full-run speed-up.
+Weather cleaning was not measured.
