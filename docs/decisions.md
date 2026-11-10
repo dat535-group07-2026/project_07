@@ -185,3 +185,33 @@ Status: agreed. Implemented on 22 October 2026.
 - This stops fork pull requests from running automatically. Approved code still
   runs on the VM with the `ubuntu` user's access, so read any workflow change
   before approving it.
+
+## D8. Measured NOAA gaps and the Gold precipitation field
+
+Status: measured on 8 November 2026 from the 2025 LCD v2 files and the first
+Gold dev run (`20261108T174718Z-fa21d594`).
+
+| Check, JFK and LGA | Result |
+| --- | --- |
+| FM-15 reports on 30 and 31 August and 1 September 2025 | 0 at both stations |
+| Gold airport-days without any weather | 6 (those three days at both airports) |
+| Flights matched to hourly weather, June to October | 99,591 of 102,640 |
+| `HourlyPrecipitation` with a value, September (JFK / LGA) | 86 of 670 / 72 of 670 |
+| `HourlyPrecipitation` with a value, October (JFK / LGA) | 98 of 739 / 76 of 738 |
+
+- Precipitation reporting changes at raw `DATE` 2025-08-26T23:51:00. Both
+  stations report `0.00` at 22:51 and a blank at 23:51. After that, neither
+  station has an explicit zero in September or October.
+- NOAA treats a blank as missing or unreported, not as zero. The files do not
+  explain why reporting changed.
+- `reported_precipitation_mm` sums the available numeric hourly precipitation
+  reports. Trace amounts are counted separately in `trace_hours`. Missing
+  reports stay missing, so an incomplete day does not give a complete daily
+  rainfall total. `precipitation_hours` shows how many hours the sum covers.
+- Correlations are calculated with SQL `CORR`, which skips missing pairs.
+  Spark's `DataFrame.stat.corr` replaces nulls with zero, so it is only used
+  after the missing pairs are removed.
+- Daily reported precipitation against average departure delay, both airports
+  together: r = 0.5438 over the 206 airport-days with a value, and r = 0.4366
+  over the 168 airport-days where all 24 hours have a numeric or trace report.
+  These are exploratory associations, not causes.
