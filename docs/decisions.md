@@ -14,7 +14,7 @@ Project deadline, including the report: 20 November 2026.
 
 ## D1. Spark runtime: Spark 3.5.0 on Java 8
 
-Status: agreed by Alexander. Awaiting confirmation by Christopher.
+Status: agreed by both.
 
 - Use the project virtual environment `/home/ubuntu/project_07/.venv`
   (Python 3.11.15, PySpark 3.5.0). It matches `/opt/spark` (Spark 3.5.0,
@@ -61,13 +61,13 @@ Status: agreed. Implemented in pull request #1, merged on 22 October 2026.
 
 ## D3. Evaluation window: June to October 2025
 
-Status: agreed by Alexander. Awaiting confirmation by Christopher.
+Status: agreed by both.
 
 | Input | Catalog assets | Rows | Raw CSV bytes |
 | --- | --- | --- | --- |
 | BTS flights | `bts:2025-06` to `bts:2025-10` | 3,013,664 | 1,365,048,769 |
-| NOAA weather | `noaa:USW00094789:2025`, `noaa:USW00014732:2025` | not yet counted by Silver | 18,072,054 |
-| Total | | | 1,383,120,823 |
+| NOAA weather | `noaa:USW00094789:2025`, `noaa:USW00014732:2025` | 26,185 | 18,072,054 |
+| Total | | 3,039,849 | 1,383,120,823 |
 
 The byte total was independently re-checked.
 
@@ -80,7 +80,12 @@ The byte total was independently re-checked.
     observe daylight saving time.
   - Actual departure times must be placed on their actual date. A flight
     scheduled in late October that is delayed past 2 November 2025 at 02:00
-    departs on standard time. This edge case needs a fixture test.
+    departs on standard time.
+  - Known limitation: Silver adds the delay to the local scheduled clock
+    without a time zone, so such a flight would be one hour off and get the
+    `F_CLOCK_DELAY_MISMATCH` warning. No flight in our data crosses that
+    change, and Gold uses the scheduled time, not the actual time. We did not
+    add a fixture test for it.
 - Weather Silver keeps the full annual observations. Limiting them to June to
   October happens at enrichment as a documented scope filter, not as a
   rejection.
@@ -94,8 +99,8 @@ Status: agreed. Final ownership:
 
 ## D5. NOAA LCD v2 `DATE` is Local Standard Time (fixed UTC-5)
 
-Status: supported by evidence. Awaiting confirmation by Christopher, who owns
-weather.
+Status: supported by evidence and agreed by both. Christopher built the weather
+Silver on it.
 
 Evidence:
 

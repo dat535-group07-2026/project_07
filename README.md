@@ -168,7 +168,7 @@ Gold produces one table, `daily_airport`, for JFK and LGA:
 The pipeline executes on the project's dedicated Spark VM environment:
 
 - **Automation:** Bronze ingestion runs via manually dispatched GitHub Actions on a dedicated self-hosted runner; its monthly schedule is paused (D2). Pending: a scheduled run of the full Bronze-to-Gold pipeline.
-- **Auditability:** Bronze writes a run manifest and keeps the source catalog. Every Silver and Gold run writes to a new `runs/<run_id>/` folder, reads its output back, writes a `_READY.json` manifest and moves the table's `current` pointer last. Silver also writes an audit table. Reruns add new run folders; nothing is skipped or deleted automatically.
+- **Auditability:** Bronze writes a run manifest and keeps the source catalog. Every Silver and Gold run writes to a new `runs/<run_id>/` folder and reads its output back. Published tables then get a `_READY.json` manifest, and their `current` pointer is moved last. The exceptions are the audit tables and `flights_quarantine`: they are written to the run folder but have no pointer. Reruns add new run folders; nothing is skipped or deleted automatically.
 - **Continuous Integration:** `.github/workflows/ci.yml` runs all unit tests on GitHub-hosted runners for every pull request and every push to `main`. The self-hosted runner is not exposed to pull requests (D7).
 - **Environments:** `--env dev --dev-user <name>` writes to `silver/dev/<name>/` and `gold/dev/<name>/`; `--env prod` writes to `silver/prod/` and `gold/prod/`. Pending: the first production run.
 
