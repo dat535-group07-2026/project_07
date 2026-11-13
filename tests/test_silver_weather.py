@@ -200,13 +200,23 @@ class WeatherSparkTests(SparkTestCase):
         ):
             cls.raw = cls.raw.withColumn(name, F.lit(val))
 
+        def with_utc_strings(frame, *columns: str):
+            for col_name in columns:
+                frame = frame.withColumn(
+                    f"{col_name}_str",
+                    F.date_format(col_name, "yyyy-MM-dd'T'HH:mm:ss"),
+                )
+            return frame
+
         cls.tables = weather.clean_weather(cls.raw)
         cls.cached = cls.tables.classified.persist(StorageLevel.MEMORY_AND_DISK)
         cls.addClassCleanup(cls.cached.unpersist)
-        cls.records = cls.cached.collect()
+        # Format Spark TIMESTAMP columns in session timeZone (UTC) before collecting,
+        # because PySpark converts collected timestamps using the host OS time zone.
+        cls.records = with_utc_strings(cls.cached, "observation_utc", "weather_hour_utc").collect()
         cls.by_label = {r.original.REM: r for r in cls.records}
         cls.counts = cls.tables.audit.first().asDict()
-        cls.hourly_rows = cls.tables.hourly.collect()
+        cls.hourly_rows = with_utc_strings(cls.tables.hourly, "weather_hour_utc").collect()
 
     def test_row_accounting_reconciles_with_scope_exclusions_and_duplicates(self) -> None:
         checks = common.check_accounting(self.counts, observed_raw=len(self.fixture_rows))
@@ -221,14 +231,19 @@ class WeatherSparkTests(SparkTestCase):
         self.assertEqual(self.counts["W_DST_LABEL_CONFLICT"], 2)
 
     def test_utc_conversion_adds_five_hours_to_lst(self) -> None:
+        from pyspark.sql.types import TimestampNTZType, TimestampType
+
+        self.assertIsInstance(self.cached.schema["observation_lst"].dataType, TimestampNTZType)
+        self.assertIsInstance(self.cached.schema["observation_utc"].dataType, TimestampType)
+        self.assertIsInstance(self.cached.schema["weather_hour_utc"].dataType, TimestampType)
+
         row = self.by_label["normal-jfk"]
         self.assertEqual(row.outcome, "retained")
         self.assertEqual(row.airport_code, "JFK")
         self.assertEqual(row.raw_date, "2025-07-15T00:51:00")
         self.assertEqual(row.observation_lst, datetime(2025, 7, 15, 0, 51, 0))
-        # Spark returns UTC timestamps as naive Python datetimes in session timeZone (UTC)
-        self.assertEqual(row.observation_utc, datetime(2025, 7, 15, 5, 51, 0))
-        self.assertEqual(row.weather_hour_utc, datetime(2025, 7, 15, 5, 0, 0))
+        self.assertEqual(row.observation_utc_str, "2025-07-15T05:51:00")
+        self.assertEqual(row.weather_hour_utc_str, "2025-07-15T05:00:00")
         self.assertAlmostEqual(row.temperature_c, 24.4)
         self.assertAlmostEqual(row.precipitation_mm, 0.0)
         self.assertFalse(row.precipitation_trace)
@@ -302,12 +317,12 @@ class WeatherSparkTests(SparkTestCase):
     def test_hourly_table_uniqueness_deterministic_selection_and_utc_partitioning(self) -> None:
         # 12 retained observations: 2 are FM-16/FM-12, 10 are FM-15 across 9 distinct UTC hours
         self.assertEqual(len(self.hourly_rows), 9)
-        keys = [(r.station_id, r.weather_hour_utc) for r in self.hourly_rows]
+        keys = [(r.station_id, r.weather_hour_utc_str) for r in self.hourly_rows]
         self.assertEqual(len(keys), len(set(keys)))
 
-        by_hour = {r.weather_hour_utc: r for r in self.hourly_rows}
+        by_hour = {r.weather_hour_utc_str: r for r in self.hourly_rows}
         # In the 2025-03-17 04:00 UTC hour, the :51 routine report (7.5 C) must win over :15 (8.0 C)
-        multi = by_hour[datetime(2025, 3, 17, 4, 0, 0)]
+        multi = by_hour["2025-03-17T04:00:00"]
         self.assertEqual(multi.fm15_reports_in_hour, 2)
         self.assertEqual(multi.raw_date, "2025-03-16T23:51:00")
         self.assertAlmostEqual(multi.temperature_c, 7.5)
@@ -316,7 +331,7 @@ class WeatherSparkTests(SparkTestCase):
         # but 2025-07-01 02:00 UTC is partitioned in July in weather_hourly.
         obs_rollover = self.by_label["month-rollover"]
         self.assertEqual((obs_rollover.year, obs_rollover.month), (2025, 6))
-        hourly_rollover = by_hour[datetime(2025, 7, 1, 2, 0, 0)]
+        hourly_rollover = by_hour["2025-07-01T02:00:00"]
         self.assertEqual((hourly_rollover.year, hourly_rollover.month), (2025, 7))
 
     def test_parquet_roundtrip_for_observations_quarantine_and_hourly(self) -> None:
