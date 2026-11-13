@@ -87,18 +87,10 @@ The byte total was independently re-checked.
 
 ## D4. Silver work split
 
-Status: as written in the local Silver planning document. Awaiting
-confirmation by Christopher.
+Status: agreed. Final ownership:
 
-| Work package | Owner | Reviewer |
-| --- | --- | --- |
-| National BTS cleaning (`flights.py`) and tests | Alexander Kvalvaag | Christopher Liebich Kolle |
-| NOAA cleaning (`weather.py`) and tests | Christopher Liebich Kolle | Alexander Kvalvaag |
-| Catalog reader and output/run contract (`common.py`) | Christopher Liebich Kolle | Alexander Kvalvaag |
-| Airport mapping, time alignment, enrichment | Both, after both cleaners work | Both |
-
-The weather package together with `common.py` is the larger share.
-Rebalance after the first thin implementations if needed.
+- Alexander: Bronze, flights, enrichment and Gold.
+- Christopher: weather, `common.py`, config/Spark, the Silver runner and CI.
 
 ## D5. NOAA LCD v2 `DATE` is Local Standard Time (fixed UTC-5)
 
@@ -215,3 +207,84 @@ Gold dev run (`20261108T174718Z-fa21d594`).
   together: r = 0.5438 over the 206 airport-days with a value, and r = 0.4366
   over the 168 airport-days where all 24 hours have a numeric or trace report.
   These are exploratory associations, not causes.
+
+## D9. Performance measurement
+
+Status: measured on 10 November 2026. Use 8 shuffle partitions for VM batch jobs.
+
+- VM: 4 vCPUs, 7.76 GiB RAM, no swap; Java 8, Python 3.11.15,
+  PySpark 3.5.0. The jobs used `local[*]`, a 3 GB driver, UTC, ANSI off
+  and adaptive query execution enabled.
+- Input: all national flights for June 2025, selected from the Bronze catalog.
+  The benchmark used the cleaners from main `091a606` without changing rules.
+- `scripts/benchmark_flights.py` runs each configuration three times, with a
+  fresh Python process and Spark JVM each time. It reads only: no Silver or
+  Gold tables, manifests or pointers are written. Spark uses temporary scratch
+  space and a disk-only cache of the classified rows, as the Silver runner does.
+
+Reproduce from the checkout, with the Java environment set as in the README:
+
+```sh
+.venv/bin/python -m scripts.benchmark_flights --shuffle-partitions 200
+.venv/bin/python -m scripts.benchmark_flights --shuffle-partitions 8
+```
+
+Times in seconds:
+
+| Step | 200 partitions, min | 200, median | 8 partitions, min | 8, median |
+| --- | ---: | ---: | ---: | ---: |
+| Select and hash-check inputs | 0.310 | 0.436 | 0.303 | 0.320 |
+| Read flights, including field-width check | 7.494 | 8.157 | 7.386 | 7.870 |
+| Clean and materialize classified rows | 35.805 | 36.276 | 33.247 | 33.253 |
+| Aggregate the audit from cached rows | 1.318 | 1.343 | 1.280 | 1.376 |
+| Total measured steps | 45.716 | 46.891 | 42.816 | 42.993 |
+
+The total is calculated for each run before taking the median. It excludes
+Spark startup, shutdown, plan printing and output writes, so it is not a full
+Silver run time. Reading the CSV payload is lazy: the read step checks line
+widths and builds the reader; parsing its rows happens during materialization.
+The classified DataFrame is persisted before `count()`, forcing Spark to
+compute all output columns and validation rules rather than prune them away.
+
+Classification was the largest measured step. The formatted execution plan
+shows a shuffle for full-row duplicate grouping, followed by a shuffle and
+sort for the candidate-key window. It also includes the parsing and validation
+expressions. The plan explains the work involved, but does not time those
+operations separately. Adaptive execution coalesces some shuffle partitions,
+so the configured partition count is not always the final task count.
+
+We tested one change: reducing `spark.sql.shuffle.partitions` from 200 to 8,
+with two partitions per VM core as a starting point for this monthly input.
+All six comparison runs returned 611575 classified rows and the same 19 audit
+counts, including all 13 rule counts: 30 cancellation-with-departure-time
+warnings, no other rule flags, no duplicate copies and no quarantined rows.
+
+The median measured total fell from 46.891 to 42.993 seconds (8.3%), and
+classification from 36.276 to 33.253 seconds (8.3%). All three eight-partition
+runs (42.816–43.281 seconds) were faster than all three baseline runs
+(45.716–47.099 seconds). We kept the change in `get_spark` for non-test jobs;
+`local[2]` and two shuffle partitions are unchanged in tests. Weather and Gold
+use this batch default too, but their performance was not measured here.
+
+These are three runs per configuration on a shared VM, not a general scaling
+result. File caches were left warm and configurations were not interleaved.
+An initial baseline overlapped dependency installation and was excluded and
+repeated; neither configuration in the table overlapped our other Spark jobs
+or dependency installation. We did not stop other users' services. A larger
+input or a different machine may need a different partition count.
+
+The comparison's per-run results and execution plans remain on the VM in
+`/home/ubuntu/dev/alkval/benchmark-flights-baseline.log` and
+`/home/ubuntu/dev/alkval/benchmark-flights-shuffle8.log`. The excluded initial
+baseline is kept separately as `benchmark-flights-baseline-initial.log`.
+
+Full-run check, separate from the benchmark above: on 10 November we also ran
+complete development runs, including output writes and read-back checks, once
+with each setting. With 200 versus eight shuffle partitions, June flights took
+59.744 versus 55.073 seconds and produced seven versus eight flight Parquet
+files. Both retained 611,575 rows, with identical values after excluding
+`silver_run_id`. The following Gold runs took 26.061 versus 22.039 seconds and
+each produced one file with 306 rows, covering 102,640 flights and 99,591
+weather matches. All checks passed. These single runs support keeping eight
+partitions on our VM, but do not establish a repeatable full-run speed-up.
+Weather cleaning was not measured.
