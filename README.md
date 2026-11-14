@@ -14,9 +14,9 @@ Status as of 10 November 2026 (deadline, including the report: 20 November 2026)
 
 - **Bronze: implemented and tested.** National BTS months June–October 2025 and the 2025 LCDv2 files for JFK and LGA are ingested, checksummed, and catalogued (3,013,664 flight rows; 1.38 GB raw CSV). See [docs/bronze-ingestion.md](docs/bronze-ingestion.md).
 - **Silver: implemented and tested.** Flights (all national rows) and weather (JFK and LGA) are cleaned, validated, quarantined where needed and published with row accounting. Flights for JFK and LGA are joined to hourly weather.
-- **Gold: implemented and tested.** One daily table per date and airport, `daily_airport`, with flight, delay, cancellation, weather and coverage metrics.
-- **Runs so far:** development runs only. The first Gold dev run covered 102,640 JFK/LGA departures, 99,591 of them matched to hourly weather.
-- **Pending:** a production run, the scheduled Bronze-to-Gold workflow, an analysis of the Gold table (the Gold consumer) and performance measurements.
+- **Gold: implemented and tested.** One daily table per date and airport, `daily_airport`, with flight, delay, cancellation, weather and coverage metrics, plus `scripts/gold_figures.py` for static summary figures and tables.
+- **Runs so far:** development runs only (plus the June 2025 shuffle-partition benchmark in D9). The first Gold dev run covered 102,640 JFK/LGA departures, 99,591 of them matched to hourly weather.
+- **Pending:** executing the first production (`prod`) run and observing the scheduled Bronze-to-Gold workflow run on the VM.
 - **Evaluation window:** June–October 2025.
 - **Decisions and evidence:** Runtime, evaluation window, time conventions, and measured data quality are recorded in [docs/decisions.md](docs/decisions.md).
 - **Historical inspection:** An earlier inspection of June 2024 inputs (611,132 flights; 5,465 next-day departures, 84 `2400` departures, 12 elapsed-time discrepancies) guided the design. These figures do not describe the 2025 inputs.
@@ -167,10 +167,12 @@ Gold produces one table, `daily_airport`, for JFK and LGA:
 
 The pipeline executes on the project's dedicated Spark VM environment:
 
-- **Automation:** Bronze ingestion runs via manually dispatched GitHub Actions on a dedicated self-hosted runner; its monthly schedule is paused (D2). Pending: a scheduled run of the full Bronze-to-Gold pipeline.
+- **Automation:**
+  - `.github/workflows/bronze-to-gold.yml` runs the full Bronze → Silver → Gold pipeline (`--env prod`) on the dedicated self-hosted VM runner on a weekly bounded schedule (Sundays at 06:17 UTC) and via manual `workflow_dispatch`, archiving run logs and Bronze/Silver/Gold manifests on the VM (`/home/ubuntu/project-data/logs/pipeline/`) and as GitHub Actions artifacts.
+  - `.github/workflows/bronze-ingestion.yml` remains available for manual Bronze-only runs; its own schedule stays paused (D2).
 - **Auditability:** Bronze writes a run manifest and keeps the source catalog. Every Silver and Gold run writes to a new `runs/<run_id>/` folder and reads its output back. Published tables then get a `_READY.json` manifest, and their `current` pointer is moved last. The exceptions are the audit tables and `flights_quarantine`: they are written to the run folder but have no pointer. Reruns add new run folders; nothing is skipped or deleted automatically.
 - **Continuous Integration:** `.github/workflows/ci.yml` runs all unit tests on GitHub-hosted runners for every pull request and every push to `main`. The self-hosted runner is not exposed to pull requests (D7).
-- **Environments:** `--env dev --dev-user <name>` writes to `silver/dev/<name>/` and `gold/dev/<name>/`; `--env prod` writes to `silver/prod/` and `gold/prod/`. Pending: the first production run.
+- **Environments:** `--env dev --dev-user <name>` writes to `silver/dev/<name>/` and `gold/dev/<name>/`; `--env prod` writes to `silver/prod/` and `gold/prod/`. Pending: executing the first production run.
 
 ---
 
@@ -213,13 +215,19 @@ Bronze ingestion and its tests need only Python 3.11 or later; see [docs/bronze-
 
 ### Running the Pipeline
 
-Run all tests:
+Make sure Java 8 is active and the VM's Jupyter driver variables are unset (from the setup step above), then run all tests:
 
 ```bash
 .venv/bin/python -m unittest discover -s tests
 ```
 
-Silver and Gold refuse to publish from a checkout with uncommitted changes, so the manifest always names the exact code. Run them in this order (dev example; replace `<name>`):
+Verify the Bronze catalog and raw files for June–October 2025 offline (see [docs/bronze-ingestion.md](docs/bronze-ingestion.md) for `manual` downloads and bounded `new` checks):
+
+```bash
+.venv/bin/python scripts/ingest_bronze.py manual --start 2025-06 --end 2025-10 --offline
+```
+
+Silver and Gold refuse to publish from a checkout with uncommitted changes, so the manifest always names the exact code. Run them in this order (`dev` example; replace `<name>`):
 
 ```bash
 .venv/bin/python -m project07.silver.run weather --env dev --dev-user <name> --year 2025
@@ -229,9 +237,31 @@ done
 .venv/bin/python -m project07.gold.run --env dev --dev-user <name>
 ```
 
-For production, replace `--env dev --dev-user <name>` with `--env prod`. In dev, Gold can read another developer's Silver tables with `--flights-user` and `--weather-user`. `--data-root` defaults to `/home/ubuntu/project-data`.
+For production, replace `--env dev --dev-user <name>` with `--env prod`:
 
-Each run prints its manifest. The published tables are read through `current` pointers, for example `silver/dev/<name>/flights/current/2025-06.json` and `gold/dev/<name>/daily_airport/current.json`.
+```bash
+.venv/bin/python -m project07.silver.run weather --env prod --year 2025
+for month in 2025-06 2025-07 2025-08 2025-09 2025-10; do
+  .venv/bin/python -m project07.silver.run flights --env prod --month "$month"
+done
+.venv/bin/python -m project07.gold.run --env prod
+```
+
+In `dev`, Gold can read another developer's Silver tables with `--flights-user` and `--weather-user`. `--data-root` defaults to `/home/ubuntu/project-data`.
+
+Each run prints its manifest. The published tables are read through `current` pointers, for example `silver/prod/flights/current/2025-06.json` and `gold/prod/daily_airport/current.json` (or under `silver/dev/<name>/` and `gold/dev/<name>/` for `dev`).
+
+Generate the Gold consumer figures and monthly summary table from published `prod` tables (or pass `--env dev --dev-user <name>` with optional `--flights-user`/`--weather-user`):
+
+```bash
+.venv/bin/python -m scripts.gold_figures --env prod --out /tmp/gold-figures
+```
+
+Reproduce the June 2025 flight-cleaning shuffle-partition benchmark (see [docs/decisions.md](docs/decisions.md), D9):
+
+```bash
+.venv/bin/python -m scripts.benchmark_flights --shuffle-partitions 8
+```
 
 ---
 

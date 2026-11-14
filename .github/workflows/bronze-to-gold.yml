@@ -1,0 +1,158 @@
+name: Bronze to Gold pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      bronze_operation:
+        description: Verify existing Bronze files, download a range, or run bounded new-release check
+        type: choice
+        options: [verify, manual, new]
+        default: verify
+      start_month:
+        description: First month to process (YYYY-MM)
+        type: string
+        default: '2025-06'
+      end_month:
+        description: Last month to process (YYYY-MM)
+        type: string
+        default: '2025-10'
+      weather_year:
+        description: NOAA LCD v2 station year (YYYY)
+        type: string
+        default: '2025'
+  schedule:
+    # Weekly bounded verification and Bronze-to-Gold run on Sundays at 06:17 UTC.
+    - cron: '17 6 * * 0'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: project07-bronze
+  cancel-in-progress: false
+
+jobs:
+  pipeline:
+    runs-on: [self-hosted, Linux, X64, project-07]
+    timeout-minutes: 120
+    env:
+      DATA_ROOT: /home/ubuntu/project-data
+      TARGET_ENV: prod
+      JAVA_HOME: /usr/lib/jvm/java-8-openjdk-amd64
+      OPERATION: ${{ github.event_name == 'schedule' && 'verify' || inputs.bronze_operation || 'verify' }}
+      START_MONTH: ${{ inputs.start_month || '2025-06' }}
+      END_MONTH: ${{ inputs.end_month || '2025-10' }}
+      WEATHER_YEAR: ${{ inputs.weather_year || '2025' }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.11 virtual environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3.11 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/venv/bin/python" -m pip install -r requirements.txt
+          echo "VENV_PY=$RUNNER_TEMP/venv/bin/python" >> "$GITHUB_ENV"
+
+      - name: Prepare log and manifest directories
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARTIFACT_DIR="$RUNNER_TEMP/pipeline-artifacts"
+          PIPELINE_LOG_ROOT="$DATA_ROOT/logs/pipeline/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "$ARTIFACT_DIR/logs" "$PIPELINE_LOG_ROOT"
+          touch "$RUNNER_TEMP/pipeline-start"
+          echo "ARTIFACT_DIR=$ARTIFACT_DIR" >> "$GITHUB_ENV"
+          echo "PIPELINE_LOG_ROOT=$PIPELINE_LOG_ROOT" >> "$GITHUB_ENV"
+
+      - name: Run unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset PYSPARK_DRIVER_PYTHON PYSPARK_DRIVER_PYTHON_OPTS
+          "$VENV_PY" -m unittest discover -s tests -v 2>&1 | tee "$ARTIFACT_DIR/logs/00-tests.log"
+
+      - name: Run Bronze ingestion
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            case "$OPERATION" in
+              verify)
+                "$VENV_PY" scripts/ingest_bronze.py manual --start "$START_MONTH" --end "$END_MONTH" --data-root "$DATA_ROOT" --offline
+                ;;
+              manual)
+                "$VENV_PY" scripts/ingest_bronze.py manual --start "$START_MONTH" --end "$END_MONTH" --data-root "$DATA_ROOT"
+                ;;
+              new)
+                "$VENV_PY" scripts/ingest_bronze.py new --since "$START_MONTH" --through "$END_MONTH" --data-root "$DATA_ROOT"
+                ;;
+              *)
+                printf 'Unknown operation: %s\n' "$OPERATION" >&2
+                exit 1
+                ;;
+            esac
+          } 2>&1 | tee "$ARTIFACT_DIR/logs/01-bronze.log"
+
+      - name: Run Silver weather
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset PYSPARK_DRIVER_PYTHON PYSPARK_DRIVER_PYTHON_OPTS
+          "$VENV_PY" -m project07.silver.run weather \
+            --env "$TARGET_ENV" \
+            --data-root "$DATA_ROOT" \
+            --year "$WEATHER_YEAR" 2>&1 | tee "$ARTIFACT_DIR/logs/02-silver-weather.log"
+
+      - name: Run Silver flights
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset PYSPARK_DRIVER_PYTHON PYSPARK_DRIVER_PYTHON_OPTS
+          MONTHS="$("$VENV_PY" -c 'import os; from scripts.ingest_bronze import month, month_range; print(" ".join(month_range(month(os.environ["START_MONTH"]), month(os.environ["END_MONTH"]))))')"
+          for month in $MONTHS; do
+            "$VENV_PY" -m project07.silver.run flights \
+              --env "$TARGET_ENV" \
+              --data-root "$DATA_ROOT" \
+              --month "$month" 2>&1 | tee "$ARTIFACT_DIR/logs/03-silver-flights-${month}.log"
+          done
+
+      - name: Run Gold daily_airport
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset PYSPARK_DRIVER_PYTHON PYSPARK_DRIVER_PYTHON_OPTS
+          "$VENV_PY" -m project07.gold.run \
+            --env "$TARGET_ENV" \
+            --data-root "$DATA_ROOT" 2>&1 | tee "$ARTIFACT_DIR/logs/04-gold.log"
+
+      - name: Collect manifests, persist logs, and write summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$VENV_PY" scripts/collect_pipeline_reports.py \
+            --data-root "$DATA_ROOT" \
+            --env "$TARGET_ENV" \
+            --artifact-dir "$ARTIFACT_DIR" \
+            --archive-dir "$PIPELINE_LOG_ROOT" \
+            --since-marker "$RUNNER_TEMP/pipeline-start" \
+            --summary-file "$GITHUB_STEP_SUMMARY" \
+            --event-name "$GITHUB_EVENT_NAME" \
+            --operation "$OPERATION" \
+            --start-month "$START_MONTH" \
+            --end-month "$END_MONTH" \
+            --weather-year "$WEATHER_YEAR"
+
+      - name: Upload pipeline logs and manifests
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bronze-to-gold-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pipeline-artifacts/**
+          if-no-files-found: warn
+          retention-days: 90
