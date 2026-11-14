@@ -135,7 +135,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          "$VENV_PY" scripts/collect_pipeline_reports.py \
+          "$VENV_PY" -m scripts.collect_pipeline_reports \
             --data-root "$DATA_ROOT" \
             --env "$TARGET_ENV" \
             --artifact-dir "$ARTIFACT_DIR" \
