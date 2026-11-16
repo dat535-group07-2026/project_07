@@ -13,6 +13,7 @@ import json
 import logging
 import re
 import shutil
+import sys
 import tempfile
 import time
 import urllib.error
@@ -24,8 +25,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+# The script is run both as `python3 scripts/ingest_bronze.py` and as a module,
+# so add the repository root to the import path to reach the shared reference table.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+from project07 import reference  # noqa: E402
+
 LOG = logging.getLogger("bronze")
-STATIONS = {"JFK": "USW00094789", "LGA": "USW00014732"}
+# Airport -> NOAA station, for every airport with weather in the reference table.
+STATIONS = {code: station for station, code in reference.weather_stations().items()}
+WEATHER_FILE = re.compile(r"LCD_([A-Z]{2}W\d{8})_(\d{4})\.csv")
 BTS_BASE = "https://transtats.bts.gov/PREZIP"
 NOAA_BASE = "https://www.ncei.noaa.gov/oa/local-climatological-data/v2/access"
 REQUIRED = {
@@ -130,7 +140,7 @@ def load_catalog(bronze):
         for item in legacy.get("files", []):
             name = Path(item["path"]).name
             flight = re.fullmatch(r"On_Time_Reporting_Carrier_On_Time_Performance_1987_present_(\d{4})_(\d{1,2})\.zip", name)
-            weather = re.fullmatch(r"LCD_(USW\d{8})_(\d{4})\.csv", name)
+            weather = WEATHER_FILE.fullmatch(name)
             if flight:
                 source = flight_source(f"{int(flight[1]):04d}-{int(flight[2]):02d}")
             elif weather:

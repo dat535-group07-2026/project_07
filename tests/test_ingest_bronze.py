@@ -22,6 +22,10 @@ def archive_bytes(members=None):
     return buffer.getvalue()
 
 
+# One BTS month plus one NOAA file per station for that year.
+ONE_FLIGHT_MONTH_AND_WEATHER = 1 + len(bronze.STATIONS)
+
+
 class FakeClient:
     def __init__(self, files):
         self.files = files
@@ -72,6 +76,29 @@ class BronzeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             bronze.month_range('2026-01', '2025-12')
 
+    def test_stations_come_from_the_reference_table(self):
+        from project07 import reference
+
+        self.assertEqual(len(bronze.STATIONS), 32)
+        self.assertEqual(bronze.STATIONS['JFK'], 'USW00094789')
+        self.assertEqual(bronze.STATIONS['LGA'], 'USW00014732')
+        self.assertEqual({v: k for k, v in bronze.STATIONS.items()}, reference.weather_stations())
+
+    def test_weather_file_names_accept_puerto_rico_stations(self):
+        self.assertEqual(bronze.WEATHER_FILE.fullmatch('LCD_RQW00011641_2026.csv').groups(),
+                         ('RQW00011641', '2026'))
+        self.assertIsNotNone(bronze.WEATHER_FILE.fullmatch('LCD_USW00094789_2025.csv'))
+        self.assertIsNone(bronze.WEATHER_FILE.fullmatch('LCD_USW0009478_2025.csv'))
+
+    def test_new_year_fetches_every_station(self):
+        self.files[bronze.flight_source('2026-01')['url']] = archive_bytes()
+        for station in bronze.STATIONS.values():
+            self.files[bronze.weather_source(2026, station)['url']] = (NOAA_HEADER + '\n').encode()
+        self.ingest('--start', '2026-01', '--end', '2026-01')
+        weather = {asset for asset in json.loads((self.bronze / 'catalog.json').read_text())['assets']
+                   if asset.startswith('noaa:')}
+        self.assertEqual(weather, {f'noaa:{station}:2026' for station in bronze.STATIONS.values()})
+
     def test_invalid_month(self):
         for value in ('2025-13', '2025-1', '1986-01', 'abc'):
             with self.assertRaises(Exception):
@@ -80,7 +107,7 @@ class BronzeTests(unittest.TestCase):
     def test_manual_download_and_idempotent_offline_rerun(self):
         first = self.ingest()
         self.assertTrue(first['new_or_changed_sources'])
-        self.assertEqual(len(first['sources']), 3)
+        self.assertEqual(len(first['sources']), ONE_FLIGHT_MONTH_AND_WEATHER)
         count = len(self.client.downloads)
         second = self.ingest('--offline')
         self.assertFalse(second['new_or_changed_sources'])
@@ -111,7 +138,7 @@ class BronzeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.ingest('--offline')
         self.assertEqual(path.read_bytes(), b'corrupt')
-        self.assertEqual(len(self.client.downloads), 3)
+        self.assertEqual(len(self.client.downloads), ONE_FLIGHT_MONTH_AND_WEATHER)
 
     def test_missing_offline_input_fails(self):
         with self.assertRaisesRegex(ValueError, 'offline'):
@@ -199,7 +226,7 @@ class BronzeTests(unittest.TestCase):
         self.client.files[bronze.flight_source('2025-07')['url']] = archive_bytes()
         result = bronze.run(self.args('new', '--through', '2025-07'), self.client)
         self.assertEqual(result['requested_months'], ['2025-07'])
-        self.assertEqual(len(result['sources']), 3)
+        self.assertEqual(len(result['sources']), ONE_FLIGHT_MONTH_AND_WEATHER)
 
     def test_new_month_refreshes_matching_annual_weather(self):
         self.ingest()
@@ -208,7 +235,7 @@ class BronzeTests(unittest.TestCase):
         self.client.files[flight['url']] = archive_bytes()
         result = bronze.run(self.args('new', '--through', '2025-07'), self.client)
         self.assertEqual(result['requested_months'], ['2025-07'])
-        self.assertEqual(len(self.client.downloads), 3)
+        self.assertEqual(len(self.client.downloads), ONE_FLIGHT_MONTH_AND_WEATHER)
 
     def test_http_404_means_unavailable_but_403_fails(self):
         for code in (404, 403):
