@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from pyspark.sql import DataFrame, SparkSession
 
 
-RULE_VERSION = "flights-0.2-working"
+RULE_VERSION = "flights-0.3"
 PROVENANCE = common.PROVENANCE
 KEY_FIELDS = (
     "FlightDate", "Reporting_Airline", "Flight_Number_Reporting_Airline",
@@ -55,7 +55,15 @@ MINUTE_FIELDS = {
     "ArrDelay": "arr_delay_min", "ArrDelayMinutes": "arr_delay_nonnegative_min",
     "CRSElapsedTime": "scheduled_elapsed_min", "ActualElapsedTime": "actual_elapsed_min",
     "AirTime": "air_time_min", "TaxiIn": "taxi_in_min", "TaxiOut": "taxi_out_min",
+    # BTS splits an arrival delay of 15+ minutes into five causes.
+    "CarrierDelay": "carrier_delay_min", "WeatherDelay": "weather_delay_min",
+    "NASDelay": "nas_delay_min", "SecurityDelay": "security_delay_min",
+    "LateAircraftDelay": "late_aircraft_delay_min",
 }
+DELAY_CAUSES = (
+    "carrier_delay_min", "weather_delay_min", "nas_delay_min",
+    "security_delay_min", "late_aircraft_delay_min",
+)
 CLOCK_FIELDS = {
     "CRSDepTime": "scheduled_dep_hhmm", "DepTime": "dep_hhmm",
     "CRSArrTime": "scheduled_arr_hhmm", "ArrTime": "arr_hhmm",
@@ -78,10 +86,11 @@ RULES = {
     "F_CANCEL_CODE_MISMATCH": ("warning", "Cancellation code disagrees with a valid cancellation flag"),
     "F_NUMERIC_UNPARSEABLE": ("warning", "Nonblank optional minute/clock token cannot be parsed"),
     "F_MINUTE_DOMAIN": ("warning", "Negative duration or clipped delay, or clipped delay differs from signed delay floored at zero"),
+    "F_DELAY_CAUSE_MISMATCH": ("warning", "Delay-cause minutes are only partly filled or do not add up to the clipped arrival delay"),
 }
 NONNEGATIVE_MINUTES = (
     "dep_delay_nonnegative_min", "arr_delay_nonnegative_min", "scheduled_elapsed_min",
-    "actual_elapsed_min", "air_time_min", "taxi_in_min", "taxi_out_min",
+    "actual_elapsed_min", "air_time_min", "taxi_in_min", "taxi_out_min", *DELAY_CAUSES,
 )
 CLIPPED_DELAYS = (
     ("dep_delay_min", "dep_delay_nonnegative_min"),
@@ -243,6 +252,15 @@ def clean_flights(raw: DataFrame) -> FlightTables:
     duration_fields = ["actual_elapsed_min", "air_time_min", "taxi_in_min", "taxi_out_min"]
     duration_present = reduce(lambda a, b: a & b, [F.col(c).isNotNull() for c in duration_fields])
     code = F.col("cancellation_code")
+    # BTS fills either all five delay causes or none, and they add up to the
+    # clipped arrival delay. Count filled source fields, so unparseable text
+    # still counts as filled (that text gets F_NUMERIC_UNPARSEABLE).
+    causes_filled = reduce(lambda a, b: a + b, [
+        _token(source).isNotNull().cast("int")
+        for source, target in MINUTE_FIELDS.items() if target in DELAY_CAUSES
+    ])
+    causes_parsed = reduce(lambda a, b: a & b, [F.col(c).isNotNull() for c in DELAY_CAUSES])
+    causes_sum = reduce(lambda a, b: a + b, [F.col(c).cast("long") for c in DELAY_CAUSES])
     conditions = {
         "F_MALFORMED_RECORD": F.col("_corrupt_record").isNotNull() | _token("_trailing_empty").isNotNull(),
         "F_KEY_MISSING": key_missing,
@@ -271,6 +289,9 @@ def clean_flights(raw: DataFrame) -> FlightTables:
             F.col(signed).isNotNull() & (F.col(clipped) != F.greatest(F.col(signed), F.lit(0)))
             for signed, clipped in CLIPPED_DELAYS
         ]),
+        "F_DELAY_CAUSE_MISMATCH": causes_filled.between(1, len(DELAY_CAUSES) - 1) | (
+            causes_parsed & ~F.coalesce(
+                causes_sum == F.col("arr_delay_nonnegative_min").cast("long"), F.lit(False))),
     }
     for severity, output in (("fatal", "rejection_reasons"), ("warning", "quality_flags")):
         frame = frame.withColumn(output, F.filter(F.array(*[
