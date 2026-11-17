@@ -22,6 +22,10 @@ SELECT origin,
        AVG(CASE WHEN NOT cancelled THEN dep_delay_min END) AS avg_dep_delay_min,
        AVG(CASE WHEN NOT cancelled AND dep_delay_min IS NOT NULL
                 THEN CASE WHEN dep_delay_min >= 15 THEN 1 ELSE 0 END END) AS delayed_15_rate,
+       -- Counts and sums, so hours can be added up over any period.
+       COUNT(CASE WHEN NOT cancelled THEN dep_delay_min END) AS flights_with_delay,
+       SUM(CASE WHEN NOT cancelled AND dep_delay_min >= 15 THEN 1 ELSE 0 END) AS delayed_15,
+       SUM(CASE WHEN NOT cancelled THEN dep_delay_min END) AS total_dep_delay_min,
        MAX(observation_utc) IS NOT NULL AS has_weather,
        MAX(temperature_c) AS temperature_c,
        MAX(precipitation_mm) AS precipitation_mm,

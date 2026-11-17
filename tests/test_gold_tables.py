@@ -57,6 +57,7 @@ class GoldTablesTests(SparkTestCase):
         self.assertEqual((jfk.flights, jfk.cancelled_flights), (3, 1))
         self.assertEqual(jfk.avg_dep_delay_min, 15.0)
         self.assertEqual(jfk.delayed_15_rate, 0.5)
+        self.assertEqual((jfk.flights_with_delay, jfk.delayed_15, jfk.total_dep_delay_min), (2, 1, 30))
         self.assertTrue(jfk.has_weather)
         self.assertEqual((jfk.visibility_km, jfk.temperature_c, jfk.thunderstorm), (3.0, 20.0, False))
         lga = rows["LGA"]
