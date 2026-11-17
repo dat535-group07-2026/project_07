@@ -1,7 +1,7 @@
 """Attach hourly weather to scheduled JFK and LGA departures.
 
 BTS clocks are local civil time, so they are converted with New York's rules.
-weather_hourly is already in UTC, converted from fixed UTC-5 (decision D5).
+weather_hourly is already in UTC, converted from each station's standard time.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ LOCAL_TIME_ZONE = "America/New_York"
 WEATHER_COLUMNS = (
     "station_id", "observation_utc", "temperature_c", "precipitation_mm", "precipitation_trace",
     "wind_speed_mps", "wind_direction_deg", "wind_direction_variable", "wind_gust_mps",
-    "visibility_km", "visibility_variable",
+    "visibility_km", "visibility_variable", "thunderstorm",
 )
 
 

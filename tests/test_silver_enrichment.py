@@ -40,7 +40,7 @@ class EnrichmentTests(unittest.TestCase):
             "cast(null as double) wind_speed_mps", "cast(null as int) wind_direction_deg",
             "cast(null as boolean) wind_direction_variable", "cast(null as double) wind_gust_mps",
             "cast(null as double) visibility_km", "cast(null as boolean) visibility_variable",
-            "'weather-hash' record_hash", "array('WEATHER_FLAG') quality_flags",
+            "cast(null as boolean) thunderstorm", "'weather-hash' record_hash", "array('WEATHER_FLAG') quality_flags",
             "month(cast(hour as timestamp)) month", "'weather.csv' source_file",
         )
 

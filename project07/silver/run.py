@@ -246,6 +246,118 @@ def run_flights_month(
             spark.stop()
 
 
+def _previous_month(month: str) -> str:
+    year, number = map(int, month.split("-"))
+    return f"{year - (number == 1):04d}-{(number - 2) % 12 + 1:02d}"
+
+
+def _manifest(silver_root, table: str, key: str) -> dict:
+    pointer = json.loads(common.current_pointer(silver_root, table, key).read_text(encoding="utf-8"))
+    return json.loads((silver_root / table / pointer["ready_manifest"]).read_text(encoding="utf-8"))
+
+
+def run_departures_month(
+    cfg: cfg_mod.PipelineConfig,
+    *,
+    month: str,
+    allow_dirty_git: bool = False,
+) -> dict:
+    """Build departures_enriched for one month: JFK/LGA departures with inbound flight and weather."""
+    from pyspark import StorageLevel
+    from pyspark.sql import functions as F
+
+    from project07 import reference
+    from project07.silver import chain
+    from project07.silver.enrichment import AIRPORTS
+
+    spark_mod.check_spark_env()
+    silver_root = cfg.silver_root
+    commit = common.clean_git_commit(allow_dirty=allow_dirty_git)
+    started = time.monotonic()
+    run_id = common.new_run_id()
+    table = "departures_enriched"
+    run_path = silver_root / table / "runs" / run_id
+    spark = spark_mod.get_spark(app_name=f"project07-departures-{month}", env=cfg.env)
+    result = None
+    try:
+        # 1. Inputs: this month's flights, the month before (for planes that arrived the
+        #    evening before), and every published weather year.
+        previous = _previous_month(month)
+        published = common.published_keys(silver_root, "flights")
+        context_months = [m for m in (previous, month) if m in published]
+        if month not in context_months:
+            raise ValueError(f"Silver flights for {month} are not published")
+        versions = {m: _manifest(silver_root, "flights", m)["rule_version"] for m in context_months}
+        if len(set(versions.values())) > 1:
+            raise ValueError(f"Flight months were cleaned with different rule versions: {versions}")
+        frames = {m: common.read_ready_table(spark, silver_root, "flights", pointer_key=m) for m in context_months}
+        month_flights = frames[month]
+        context = frames[month] if len(frames) == 1 else frames[previous].unionByName(frames[month])
+        weather_hourly, weather_pointers = common.read_ready_tables(spark, silver_root, "weather_hourly")
+        airports = reference.load_airports()
+
+        # 2. Build, and keep the result on disk while it is counted and written.
+        candidates = chain.inbound_candidates(context, airports)
+        unknown = chain.unknown_inbound_airports(candidates)
+        result = chain.build_departures(month_flights, context, weather_hourly, airports) \
+            .persist(StorageLevel.DISK_ONLY)
+
+        # 3. Checks: every JFK/LGA departure once, every inbound flight used at most once.
+        rows = result.count()
+        silver_departures = month_flights.filter(F.col("origin").isin(*AIRPORTS)).count()
+        status = {r["link_status"]: r["count"] for r in result.groupBy("link_status").count().collect()}
+        linked = result.filter("link_status = 'linked'")
+        counts = {
+            "departures": rows,
+            "silver_jfk_lga_departures": silver_departures,
+            **{f"link_{s}": status.get(s, 0) for s in chain.LINK_STATUSES},
+            "local_weather_matched": result.filter("observation_utc IS NOT NULL").count(),
+            "inbound_origin_has_station": linked.filter("origin_has_station").count(),
+            "origin_weather_matched": linked.filter("origin_observation_utc IS NOT NULL").count(),
+        }
+        checks = {
+            "departures_match_silver": rows == silver_departures,
+            "departures_unique": result.select("record_hash").distinct().count() == rows,
+            "inbound_used_once": linked.select("inbound_record_hash").distinct().count() == counts["link_linked"],
+            "inbound_airports_in_reference_table": not unknown,
+        }
+        if not all(checks.values()):
+            raise ValueError(f"Departure checks failed, nothing published: {checks} {counts} unknown={unknown}")
+
+        # 4. Write, read back, then publish the pointer last.
+        checks["readback_count"] = common.write_parquet_and_verify(spark, result, run_path, rows)
+        if not checks["readback_count"]:
+            raise ValueError(f"Read-back count differs from {rows}, nothing published")
+        report = {
+            "run_id": run_id,
+            "git_commit": commit,
+            "rule_version": chain.RULE_VERSION,
+            "env": cfg.env,
+            "dev_user": cfg.dev_user,
+            "month": month,
+            "inputs": {
+                "flights": {m: _manifest(silver_root, "flights", m)["run_id"] for m in context_months},
+                "previous_month_available": previous in context_months,
+                "weather_hourly": weather_pointers,
+            },
+            "counts": counts,
+            "checks": checks,
+            "spark_version": spark.version,
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+            "outputs": {table: common.output_summary(run_path, silver_root)},
+        }
+        common.publish_ready(silver_root, table, run_path / "_READY.json", report,
+                             pointer_key=month, extra_pointer_fields={"month": month})
+        print(json.dumps(report, indent=2, default=str))
+        return report
+    finally:
+        try:
+            if result is not None:
+                result.unpersist()
+        finally:
+            spark.stop()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="dataset", required=True)
@@ -275,6 +387,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="BTS flight month formatted as YYYY-MM.",
     )
 
+    departures_parser = subparsers.add_parser(
+        "departures", help="Link one month of JFK/LGA departures to inbound flights and weather.")
+    cfg_mod.add_config_args(departures_parser)
+    departures_parser.add_argument(
+        "--month",
+        required=True,
+        type=_validate_month,
+        help="Flight month formatted as YYYY-MM.",
+    )
+
     return parser
 
 
@@ -290,6 +412,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             run_weather(cfg, year=args.year, stations=args.stations)
         elif args.dataset == "flights":
             run_flights_month(cfg, month=args.month)
+        elif args.dataset == "departures":
+            run_departures_month(cfg, month=args.month)
     except Exception:
         LOG.exception("Silver %s run failed", args.dataset)
         return 1
