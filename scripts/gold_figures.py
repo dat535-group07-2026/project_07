@@ -111,16 +111,18 @@ def main(argv=None):
                    'Visibility in the scheduled departure hour', (0, 45))
 
         # 3. Delay propagation: how late the inbound plane was.
+        # BTS splits a flight's arrival delay into causes; "late aircraft" is the part the
+        # airline blames on the plane arriving late. Shown per departure as a check on the links.
         chain = {r.band: r for r in spark.sql('''SELECT inbound_delay_band AS band,
-                   SUM(departures_with_delay) AS flights, SUM(delayed_15) AS delayed,
-                   SUM(total_dep_delay_min) AS dep_minutes,
+                   SUM(departures) AS departures, SUM(departures_with_delay) AS flights,
+                   SUM(delayed_15) AS delayed, SUM(total_dep_delay_min) AS dep_minutes,
                    SUM(bts_late_aircraft_delay_min) AS late_aircraft_minutes
             FROM departure_chain GROUP BY 1''').collect()}
         for band in INBOUND_BANDS:
             r = chain[band]
             print(f'Inbound {band} min late: n={r.flights}, delayed 15+ = {_pct(r.delayed, r.flights):.1f}%, '
                   f'avg delay {r.dep_minutes / r.flights:.1f} min, '
-                  f'BTS late-aircraft share of delay minutes {_pct(r.late_aircraft_minutes, max(r.dep_minutes, 1)):.1f}%')
+                  f'BTS late-aircraft minutes per departure {(r.late_aircraft_minutes or 0) / r.departures:.1f}')
         shown = [chain[b] for b in INBOUND_BANDS]
         _bar_chart(plt, args.out / 'delay_propagation.png', [f'{b}' for b in INBOUND_BANDS],
                    [_pct(r.delayed, r.flights) for r in shown], [r.flights for r in shown],
