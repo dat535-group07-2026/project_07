@@ -108,7 +108,7 @@ def main(argv=None):
         shown = [bands[b] for b in BANDS[:4] if b in bands]
         _bar_chart(plt, args.out / 'visibility_vs_delay.png', [r.band.replace('>=', '≥') for r in shown],
                    [_pct(r.delayed, r.flights) for r in shown], [r.flights for r in shown],
-                   'Visibility in the scheduled departure hour', (0, 45))
+                   'Visibility in the scheduled departure hour', (0, 40))
 
         # 3. Delay propagation: how late the inbound plane was.
         # BTS splits a flight's arrival delay into causes; "late aircraft" is the part the
