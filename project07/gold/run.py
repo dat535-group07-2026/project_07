@@ -1,7 +1,12 @@
-"""Build the Gold daily_airport table from published Silver flights and weather.
+"""Build the Gold tables from published Silver departures_enriched, flights and weather.
 
-By default Gold uses every published flight month; --start/--end limit the period.
-Weather is read for every published year.
+Three tables, each with its own pointer:
+  - daily_airport:   one row per departure airport and day (flights, delays, daily weather);
+  - airport_hour:    one row per departure airport and hour (flights, delays, that hour's weather);
+  - departure_chain: linked departures by how late the inbound plane was and the weather at both ends.
+
+By default Gold uses every published month of departures_enriched; --start/--end
+limit the period. Weather is read for every published year.
 
 Example (dev, June-October 2025):
     python -m project07.gold.run --env dev --dev-user alkval --start 2025-06 --end 2025-10
@@ -17,12 +22,12 @@ from typing import Sequence
 
 from project07 import config as cfg_mod
 from project07 import spark as spark_mod
-from project07.gold import daily
+from project07.gold import chain, daily, hourly
 from project07.silver import common
-from project07.silver.enrichment import AIRPORTS, enrich_flights
+from project07.silver.enrichment import AIRPORTS
 
 LOG = logging.getLogger(__name__)
-TABLE = "daily_airport"
+TABLES = ("daily_airport", "airport_hour", "departure_chain")
 # Gold fails if a month has fewer flights matched to weather than this. The lowest
 # real months are about 92% (NOAA gaps on 30-31 Aug and 1 Sep 2025), so 80% only
 # catches real errors, such as a weather year that was not published.
@@ -30,21 +35,25 @@ MIN_WEATHER_COVERAGE = 0.80
 
 
 def select_months(published: Sequence[str], start: str | None = None, end: str | None = None) -> list[str]:
-    """Published flight months between start and end (both optional, inclusive)."""
+    """Published months between start and end (both optional, inclusive)."""
     months = [m for m in sorted(published) if (start is None or m >= start) and (end is None or m <= end)]
     if not months:
-        raise ValueError(f"No published flight months between {start} and {end}")
+        raise ValueError(f"No published months between {start} and {end}")
     return months
 
 
-def flight_rule_versions(silver_root, months: Sequence[str]) -> dict[str, str]:
-    """Rule version of each published flight month, read from its _READY.json."""
+def rule_versions(silver_root, table: str, months: Sequence[str]) -> dict[str, str]:
+    """Rule version of each published month of a table, read from its _READY.json."""
     versions = {}
     for month in months:
-        pointer = _pointer(silver_root, "flights", month)
-        manifest = json.loads((silver_root / "flights" / pointer["ready_manifest"]).read_text(encoding="utf-8"))
+        pointer = _pointer(silver_root, table, month)
+        manifest = json.loads((silver_root / table / pointer["ready_manifest"]).read_text(encoding="utf-8"))
         versions[month] = manifest["rule_version"]
     return versions
+
+
+def flight_rule_versions(silver_root, months: Sequence[str]) -> dict[str, str]:
+    return rule_versions(silver_root, "flights", months)
 
 
 def weather_coverage_per_month(enriched) -> dict[str, float]:
@@ -66,6 +75,21 @@ def _rows_per_month(frame) -> dict[str, int]:
     return {row["month"]: row["count"] for row in rows.orderBy("month").collect()}
 
 
+def _read_months(spark, silver_root, table: str, months: Sequence[str], inputs: dict):
+    frame = None
+    for month in months:
+        part = common.read_ready_table(spark, silver_root, table, pointer_key=month)
+        frame = part if frame is None else frame.unionByName(part)
+        inputs[f"{table} {month}"] = _pointer(silver_root, table, month)
+    return frame
+
+
+def _total(frame, column: str) -> int:
+    from pyspark.sql import functions as F
+
+    return frame.agg(F.sum(column)).first()[0] or 0
+
+
 def run_gold(
     cfg: cfg_mod.PipelineConfig,
     flights_cfg: cfg_mod.PipelineConfig,
@@ -83,60 +107,68 @@ def run_gold(
     started = time.monotonic()
     run_id = common.new_run_id()
     gold_root = cfg.gold_root
-    run_path = gold_root / TABLE / "runs" / run_id
+    silver_root = flights_cfg.silver_root
     spark = spark_mod.get_spark(app_name="project07-gold", env=cfg.env)
-    enriched = None
+    departures = None
     try:
-        # 1. Read the published inputs through their pointers.
-        months = select_months(common.published_keys(flights_cfg.silver_root, "flights"), start, end)
-        # All months must come from the same flight rules, or their columns differ.
-        versions = flight_rule_versions(flights_cfg.silver_root, months)
-        if len(set(versions.values())) > 1:
-            raise ValueError(f"Flight months were cleaned with different rule versions, re-run Silver: {versions}")
-        inputs = {}
-        flights = None
-        for month in months:
-            frame = common.read_ready_table(spark, flights_cfg.silver_root, "flights", pointer_key=month)
-            flights = frame if flights is None else flights.unionByName(frame)
-            inputs[f"flights {month}"] = _pointer(flights_cfg.silver_root, "flights", month)
-        # Weather is published per year; read every published year.
+        # 1. Read the published inputs through their pointers. Each table's months must
+        #    come from one rule version, or their columns differ.
+        months = select_months(common.published_keys(silver_root, "departures_enriched"), start, end)
+        for table in ("flights", "departures_enriched"):
+            versions = rule_versions(silver_root, table, months)
+            if len(set(versions.values())) > 1:
+                raise ValueError(f"{table} months were built with different rule versions, re-run Silver: {versions}")
+        inputs: dict = {}
+        flights = _read_months(spark, silver_root, "flights", months, inputs)
+        departures = _read_months(spark, silver_root, "departures_enriched", months, inputs) \
+            .persist(StorageLevel.DISK_ONLY)
         weather_hourly, inputs["weather_hourly"] = common.read_ready_tables(
             spark, weather_cfg.silver_root, "weather_hourly")
 
-        # 2. Join, and keep the result on disk so it is not recomputed for each step.
-        enriched = enrich_flights(flights, weather_hourly).persist(StorageLevel.DISK_ONLY)
+        # 2. Build the three tables (daily weather only for the departure airports).
+        tables = {
+            "daily_airport": daily.daily_airport(
+                departures, weather_hourly.filter(F.col("airport_code").isin(*AIRPORTS))),
+            "airport_hour": hourly.airport_hour(departures),
+            "departure_chain": chain.departure_chain(departures),
+        }
+        rows = {name: frame.count() for name, frame in tables.items()}
+        coverage = weather_coverage_per_month(departures)
 
-        # 3. Build the daily table (weather only for the departure airports).
-        table = daily.daily_airport(enriched, weather_hourly.filter(F.col("airport_code").isin(*AIRPORTS)))
-        gold_rows = table.count()
-        coverage = weather_coverage_per_month(enriched)
-
-        # 4. Reconcile before publishing: no flight may be lost or counted twice.
+        # 3. Reconcile before publishing: no flight may be lost or counted twice.
         silver_per_month = _rows_per_month(flights.filter(F.col("origin").isin(*AIRPORTS)))
-        enriched_per_month = _rows_per_month(enriched)
-        enriched_rows = sum(enriched_per_month.values())
-        gold_flights = table.agg(F.sum("flights")).first()[0]
+        departures_per_month = _rows_per_month(departures)
+        departure_rows = sum(departures_per_month.values())
+        linked = departures.filter("link_status = 'linked'").count()
         counts = {
             "silver_jfk_lga_flights": silver_per_month,
-            "enriched_flights": enriched_per_month,
-            "gold_flights": gold_flights,
-            "gold_rows": gold_rows,
-            "flights_with_weather": table.agg(F.sum("flights_with_weather")).first()[0],
-            "days_without_weather": table.filter(F.col("weather_hours").isNull()).count(),
+            "departures_enriched": departures_per_month,
+            "linked_departures": linked,
+            "rows": rows,
+            "daily_airport_flights": _total(tables["daily_airport"], "flights"),
+            "airport_hour_flights": _total(tables["airport_hour"], "flights"),
+            "departure_chain_departures": _total(tables["departure_chain"], "departures"),
+            "flights_with_weather": _total(tables["daily_airport"], "flights_with_weather"),
+            "days_without_weather": tables["daily_airport"].filter(F.col("weather_hours").isNull()).count(),
             "weather_coverage_per_month": coverage,
         }
         checks = {
-            "enriched_matches_silver_per_month": enriched_per_month == silver_per_month,
-            "gold_flights_match_enriched": gold_flights == enriched_rows,
+            "departures_match_silver_per_month": departures_per_month == silver_per_month,
+            "daily_airport_flights_match": counts["daily_airport_flights"] == departure_rows,
+            "airport_hour_flights_match": counts["airport_hour_flights"] == departure_rows,
+            "departure_chain_matches_linked": counts["departure_chain_departures"] == linked,
             "weather_coverage_every_month": all(v >= MIN_WEATHER_COVERAGE for v in coverage.values()),
         }
         if not all(checks.values()):
             raise ValueError(f"Gold reconciliation failed, nothing published: {checks} {counts}")
 
-        # 5. Write, read back, then publish the pointer last.
-        checks["readback_count"] = common.write_parquet_and_verify(spark, table, run_path, gold_rows)
-        if not checks["readback_count"]:
-            raise ValueError(f"Gold read-back count differs from {gold_rows}, nothing published")
+        # 4. Write and read back every table, then publish the pointers last.
+        paths = {name: gold_root / name / "runs" / run_id for name in TABLES}
+        for name, frame in tables.items():
+            checks[f"{name}_readback_count"] = common.write_parquet_and_verify(
+                spark, frame, paths[name], rows[name])
+        if not all(checks.values()):
+            raise ValueError(f"Gold read-back failed, nothing published: {checks}")
         report = {
             "run_id": run_id,
             "git_commit": commit,
@@ -148,15 +180,16 @@ def run_gold(
             "checks": checks,
             "spark_version": spark.version,
             "elapsed_seconds": round(time.monotonic() - started, 3),
-            "output": common.output_summary(run_path, gold_root),
+            "outputs": {name: common.output_summary(path, gold_root) for name, path in paths.items()},
         }
-        common.publish_ready(gold_root, TABLE, run_path / "_READY.json", report)
+        for name in TABLES:
+            common.publish_ready(gold_root, name, paths[name] / "_READY.json", report)
         print(json.dumps(report, indent=2))
         return report
     finally:
         try:
-            if enriched is not None:
-                enriched.unpersist()
+            if departures is not None:
+                departures.unpersist()
         finally:
             spark.stop()
 
@@ -164,10 +197,10 @@ def run_gold(
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     cfg_mod.add_config_args(parser)
-    parser.add_argument("--flights-user", help="Dev only: whose Silver flights to read (default --dev-user).")
+    parser.add_argument("--flights-user", help="Dev only: whose Silver flights and departures to read (default --dev-user).")
     parser.add_argument("--weather-user", help="Dev only: whose Silver weather to read (default --dev-user).")
-    parser.add_argument("--start", help="First flight month, YYYY-MM (default: first published).")
-    parser.add_argument("--end", help="Last flight month, YYYY-MM (default: last published).")
+    parser.add_argument("--start", help="First month, YYYY-MM (default: first published).")
+    parser.add_argument("--end", help="Last month, YYYY-MM (default: last published).")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     try:

@@ -18,7 +18,7 @@ class MonthSelectionTests(unittest.TestCase):
         self.assertEqual(run.select_months(self.PUBLISHED, "2025-07", "2025-12"), ["2025-07", "2025-12"])
 
     def test_no_month_in_range_fails(self):
-        with self.assertRaisesRegex(ValueError, "No published flight months"):
+        with self.assertRaisesRegex(ValueError, "No published months"):
             run.select_months(self.PUBLISHED, "2024-01", "2024-12")
 
 
