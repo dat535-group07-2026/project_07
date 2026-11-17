@@ -230,3 +230,6 @@ __marimo__/
 
 # Local Silver implementation handoff
 /docs/silver-work-split.md
+
+# macOS folder metadata
+.DS_Store
