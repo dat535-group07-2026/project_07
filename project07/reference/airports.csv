@@ -1,8 +1,11 @@
 # Airport reference table for project07.
 #
 # One row per airport: the departure airports JFK and LGA, and every airport that
-# had a BTS flight to JFK or LGA in June-October 2025 (counted from the raw Bronze
-# BTS files, 102 airports in total).
+# had a BTS flight to or from JFK or LGA in January 2025 - August 2026 (counted
+# from the raw Bronze BTS files, 113 airports in total). The last 11 rows were
+# added after the backfill; they are seasonal routes, plus DJT, which is the new
+# BTS code for West Palm Beach (PBI) from August 2026. DJT has no NOAA station of
+# its own here, because PBI's station is already listed under PBI.
 #
 # Columns:
 #   airport       BTS/IATA code, as in the BTS Origin and Dest columns.
@@ -124,3 +127,14 @@ SBN,"South Bend, IN",America/Indiana/Indianapolis,
 PSP,"Palm Springs, CA",America/Los_Angeles,
 PHL,"Philadelphia, PA",America/New_York,
 EYW,"Key West, FL",America/New_York,
+AGS,"Augusta, GA",America/New_York,
+DAB,"Daytona Beach, FL",America/New_York,
+DJT,"West Palm Beach/Palm Beach, FL",America/New_York,
+EGE,"Eagle, CO",America/Denver,
+GRB,"Green Bay, WI",America/Chicago,
+JAC,"Jackson, WY",America/Denver,
+LEX,"Lexington, KY",America/New_York,
+PNS,"Pensacola, FL",America/Chicago,
+SJC,"San Jose, CA",America/Los_Angeles,
+VPS,"Valparaiso, FL",America/Chicago,
+VRB,"Vero Beach, FL",America/New_York,

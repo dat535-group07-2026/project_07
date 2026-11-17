@@ -21,7 +21,7 @@ class AirportTableTests(unittest.TestCase):
         self.airports = reference.load_airports()
 
     def test_table_covers_jfk_lga_and_their_inbound_airports(self):
-        self.assertEqual(len(self.airports), 102)
+        self.assertEqual(len(self.airports), 113)
         for code in ("JFK", "LGA", "ORD", "HNL", "SJU", "STT", "ANC"):
             self.assertIn(code, self.airports)
 
