@@ -246,16 +246,6 @@ def run_flights_month(
             spark.stop()
 
 
-def _previous_month(month: str) -> str:
-    year, number = map(int, month.split("-"))
-    return f"{year - (number == 1):04d}-{(number - 2) % 12 + 1:02d}"
-
-
-def _manifest(silver_root, table: str, key: str) -> dict:
-    pointer = json.loads(common.current_pointer(silver_root, table, key).read_text(encoding="utf-8"))
-    return json.loads((silver_root / table / pointer["ready_manifest"]).read_text(encoding="utf-8"))
-
-
 def run_departures_month(
     cfg: cfg_mod.PipelineConfig,
     *,
@@ -282,12 +272,13 @@ def run_departures_month(
     try:
         # 1. Inputs: this month's flights, the month before (for planes that arrived the
         #    evening before), and every published weather year.
-        previous = _previous_month(month)
+        previous = common.previous_month(month)
         published = common.published_keys(silver_root, "flights")
         context_months = [m for m in (previous, month) if m in published]
         if month not in context_months:
             raise ValueError(f"Silver flights for {month} are not published")
-        versions = {m: _manifest(silver_root, "flights", m)["rule_version"] for m in context_months}
+        manifests = {m: common.read_manifest(silver_root, "flights", m) for m in context_months}
+        versions = {m: report["rule_version"] for m, report in manifests.items()}
         if len(set(versions.values())) > 1:
             raise ValueError(f"Flight months were cleaned with different rule versions: {versions}")
         frames = {m: common.read_ready_table(spark, silver_root, "flights", pointer_key=m) for m in context_months}
@@ -336,7 +327,7 @@ def run_departures_month(
             "dev_user": cfg.dev_user,
             "month": month,
             "inputs": {
-                "flights": {m: _manifest(silver_root, "flights", m)["run_id"] for m in context_months},
+                "flights": {m: report["run_id"] for m, report in manifests.items()},
                 "previous_month_available": previous in context_months,
                 "weather_hourly": weather_pointers,
             },

@@ -302,6 +302,30 @@ def current_pointer(silver_root: Path, table: str, key: str | None = None) -> Pa
     return table_dir / "current" / f"{key}.json"
 
 
+def read_pointer(root: Path, table: str, key: str | None = None) -> dict | None:
+    """The published pointer of a table (or of one key of it), or None if nothing is published."""
+    path = current_pointer(root, table, key)
+    return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+
+
+def read_manifest(root: Path, table: str, key: str | None = None) -> dict | None:
+    """The _READY.json of the published run of a table (or key), or None if nothing is published."""
+    pointer = read_pointer(root, table, key)
+    if pointer is None:
+        return None
+    table_dir = (Path(root) / table).resolve()
+    path = (table_dir / pointer["ready_manifest"]).resolve()
+    if not path.is_relative_to(table_dir) or not path.is_file():
+        raise ValueError(f"Missing or invalid _READY.json manifest: {path}")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def previous_month(month: str) -> str:
+    """The month before a YYYY-MM month, e.g. 2025-01 -> 2024-12."""
+    year, number = map(int, month.split("-"))
+    return f"{year - (number == 1):04d}-{(number - 2) % 12 + 1:02d}"
+
+
 def input_snapshot(assets: Sequence[SelectedAsset], bronze_root: Path) -> list[dict]:
     """Serialize selected Bronze assets and relative file paths for _READY.json manifests."""
     root = Path(bronze_root).resolve()

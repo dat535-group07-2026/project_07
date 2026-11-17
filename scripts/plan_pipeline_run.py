@@ -47,18 +47,8 @@ def bronze_versions(bronze_root: Path) -> dict:
     return result
 
 
-def manifest(root: Path, table: str, key: str | None = None) -> dict | None:
-    """The published _READY.json of a table (or one key of it), or None if nothing is published."""
-    pointer_path = common.current_pointer(root, table, key)
-    if not pointer_path.is_file():
-        return None
-    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
-    return json.loads((Path(root) / table / pointer["ready_manifest"]).read_text(encoding="utf-8"))
-
-
 def _run_id(root: Path, table: str, key: str | None = None) -> str | None:
-    pointer_path = common.current_pointer(root, table, key)
-    return json.loads(pointer_path.read_text(encoding="utf-8"))["run_id"] if pointer_path.is_file() else None
+    return (common.read_pointer(root, table, key) or {}).get("run_id")
 
 
 def _input_shas(report: dict) -> dict[str, str]:
@@ -70,7 +60,7 @@ def stale_flight_months(bronze: dict, silver_root: Path, since: str) -> list[str
     for month, sha in sorted(bronze["bts"].items()):
         if month < since:
             continue
-        report = manifest(silver_root, "flights", month)
+        report = common.read_manifest(silver_root, "flights", month)
         if (report is None or report.get("rule_version") != flights.RULE_VERSION
                 or _input_shas(report).get(f"bts:{month}") != sha):
             stale.append(month)
@@ -84,16 +74,11 @@ def stale_weather_years(bronze: dict, silver_root: Path, since: str) -> list[str
         if year < since[:4]:
             continue
         expected = {f"noaa:{station}:{year}": sha for station, sha in files.items() if station in stations}
-        report = manifest(silver_root, "weather_hourly", year)
+        report = common.read_manifest(silver_root, "weather_hourly", year)
         if (report is None or report.get("rule_version") != weather.RULE_VERSION
                 or set(report.get("stations", [])) != stations or _input_shas(report) != expected):
             stale.append(year)
     return stale
-
-
-def _previous_month(month: str) -> str:
-    year, number = map(int, month.split("-"))
-    return f"{year - (number == 1):04d}-{(number - 2) % 12 + 1:02d}"
 
 
 def _weather_run_ids(silver_root: Path) -> dict[str, str]:
@@ -108,8 +93,8 @@ def stale_departure_months(silver_root: Path, since: str) -> list[str]:
     for month in published:
         if month < since:
             continue
-        report = manifest(silver_root, "departures_enriched", month)
-        context = [m for m in (_previous_month(month), month) if m in published]
+        report = common.read_manifest(silver_root, "departures_enriched", month)
+        context = [m for m in (common.previous_month(month), month) if m in published]
         flights_now = {m: _run_id(silver_root, "flights", m) for m in context}
         if report is None or report.get("rule_version") != chain.RULE_VERSION:
             stale.append(month)
@@ -122,7 +107,7 @@ def stale_departure_months(silver_root: Path, since: str) -> list[str]:
 
 
 def gold_needed(gold_root: Path, silver_root: Path, since: str) -> bool:
-    report = manifest(gold_root, GOLD_TABLE)
+    report = common.read_manifest(gold_root, GOLD_TABLE)
     if report is None:
         return True
     # One Gold run publishes all three tables. If a run stopped half-way, they differ.

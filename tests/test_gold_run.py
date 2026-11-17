@@ -35,7 +35,7 @@ class RuleVersionTests(unittest.TestCase):
                 manifest = root / "flights" / "runs" / month / "_READY.json"
                 common.publish_ready(root, "flights", manifest, {"run_id": month, "rule_version": version},
                                      pointer_key=month)
-            self.assertEqual(run.flight_rule_versions(root, ["2025-06", "2025-07"]),
+            self.assertEqual(run.rule_versions(root, "flights", ["2025-06", "2025-07"]),
                              {"2025-06": "flights-0.3", "2025-07": "flights-0.2"})
 
 

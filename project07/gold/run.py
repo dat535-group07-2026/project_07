@@ -44,16 +44,7 @@ def select_months(published: Sequence[str], start: str | None = None, end: str |
 
 def rule_versions(silver_root, table: str, months: Sequence[str]) -> dict[str, str]:
     """Rule version of each published month of a table, read from its _READY.json."""
-    versions = {}
-    for month in months:
-        pointer = _pointer(silver_root, table, month)
-        manifest = json.loads((silver_root / table / pointer["ready_manifest"]).read_text(encoding="utf-8"))
-        versions[month] = manifest["rule_version"]
-    return versions
-
-
-def flight_rule_versions(silver_root, months: Sequence[str]) -> dict[str, str]:
-    return rule_versions(silver_root, "flights", months)
+    return {month: common.read_manifest(silver_root, table, month)["rule_version"] for month in months}
 
 
 def weather_coverage_per_month(enriched) -> dict[str, float]:
@@ -63,11 +54,6 @@ def weather_coverage_per_month(enriched) -> dict[str, float]:
         "CASE WHEN observation_utc IS NULL THEN 0 ELSE 1 END AS matched",
     ).groupBy("month").agg({"matched": "avg"}).collect()
     return {row["month"]: round(row["avg(matched)"], 4) for row in sorted(rows)}
-
-
-def _pointer(silver_root, table, key=None) -> dict:
-    """The current pointer of an input table, recorded in the Gold manifest."""
-    return json.loads(common.current_pointer(silver_root, table, key).read_text(encoding="utf-8"))
 
 
 def _rows_per_month(frame) -> dict[str, int]:
@@ -80,7 +66,7 @@ def _read_months(spark, silver_root, table: str, months: Sequence[str], inputs: 
     for month in months:
         part = common.read_ready_table(spark, silver_root, table, pointer_key=month)
         frame = part if frame is None else frame.unionByName(part)
-        inputs[f"{table} {month}"] = _pointer(silver_root, table, month)
+        inputs[f"{table} {month}"] = common.read_pointer(silver_root, table, month)
     return frame
 
 
