@@ -374,8 +374,8 @@ Status: implemented on 17 November 2026. Rule version `weather-0.2`.
   reported.
 - 2025: 425,669 rows read, 413,477 kept, 12,064 SOD/SOM summaries out of scope,
   128 quarantined (daylight-saving label conflicts), 276,347 hourly rows.
-- 2026: 354,802 rows read, 10,167 out of scope, 255 quarantined, 233,634 hourly
-  rows. The 255 rows are a report type NOAA started using on 15 April 2026,
+- 2026: 354,802 rows read, 344,380 kept, 10,167 out of scope, 255 quarantined,
+  233,634 hourly rows. The 255 rows are a report type NOAA started using on 15 April 2026,
   `FM94_1`, about 8 per station. Unknown report types are quarantined by
   design (`W_KEY_INVALID`); the hourly table uses FM-15 only, so results are
   not affected.

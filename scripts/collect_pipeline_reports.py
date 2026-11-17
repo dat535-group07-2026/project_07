@@ -49,9 +49,10 @@ def collect_layer_manifests(
     if not layer_root.is_dir():
         return collected
 
-    pointer_files = sorted(layer_root.glob("*/current.json")) + sorted(
-        layer_root.glob("*/current/*.json")
-    )
+    # A table published per key (current/<month or year>.json) may still have an old
+    # single current.json from before it was split. Skip that old pointer.
+    single = [p for p in sorted(layer_root.glob("*/current.json")) if not (p.parent / "current").is_dir()]
+    pointer_files = single + sorted(layer_root.glob("*/current/*.json"))
     for pointer_path in pointer_files:
         rel_pointer = pointer_path.relative_to(layer_root)
         dest_pointer = out_dir / rel_pointer

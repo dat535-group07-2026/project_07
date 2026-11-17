@@ -140,6 +140,16 @@ class CollectPipelineReportsTests(unittest.TestCase):
         self.assertIn("`flights (2025-06)` (`f-1`, `abcdef1`): raw=100, retained=98, quarantined=2", summary)
         self.assertIn("`daily_airport` (`g-1`, `abcdef1`): rows=306, flights=102640, with_weather=99591", summary)
 
+    def test_old_single_pointer_is_skipped_once_a_table_has_per_key_pointers(self) -> None:
+        silver_root = self.data_root / "silver" / "prod"
+        common.publish_ready(silver_root, "weather_hourly",
+                             silver_root / "weather_hourly" / "runs" / "old" / "_READY.json", {"run_id": "old"})
+        common.publish_ready(silver_root, "weather_hourly",
+                             silver_root / "weather_hourly" / "runs" / "new" / "_READY.json", {"run_id": "new"},
+                             pointer_key="2025")
+        entries = collector.collect_layer_manifests(silver_root, self.artifact_dir / "manifests" / "silver")
+        self.assertEqual([rel for rel, _, _ in entries], ["weather_hourly/current/2025.json"])
+
     def test_summary_shows_departures_and_the_three_gold_tables(self) -> None:
         silver_root = self.data_root / "silver" / "prod"
         common.publish_ready(
