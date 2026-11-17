@@ -5,10 +5,10 @@ Run from the checkout: python -m scripts.gold_figures --env dev --dev-user alkva
 """
 
 import argparse
+import json
 from pathlib import Path
 
 from project07 import config, spark as spark_mod
-from project07.gold.run import MONTHS
 from project07.silver import common
 from project07.silver.enrichment import enrich_flights
 
@@ -68,8 +68,11 @@ def main(argv=None):
         plt.close(fig)
         print(caption)
 
+        # Use the same flight months as the published Gold table.
+        pointer = json.loads(common.current_pointer(cfg.gold_root, 'daily_airport').read_text())
+        months = json.loads((cfg.gold_root / 'daily_airport' / pointer['ready_manifest']).read_text())['months']
         flights = None
-        for month in MONTHS:
+        for month in months:
             frame = common.read_ready_table(spark, flights_cfg.silver_root, 'flights', pointer_key=month)
             flights = frame if flights is None else flights.unionByName(frame)
         weather, _ = common.read_ready_tables(spark, weather_cfg.silver_root, 'weather_hourly')
