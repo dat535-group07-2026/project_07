@@ -399,3 +399,27 @@ def read_ready_table(
     run_dir = manifest_path.parent
     return spark.read.parquet(str(run_dir))
 
+
+def published_keys(silver_root: Path, table: str) -> list[str]:
+    """The keys of a table's per-key pointers, e.g. the years of weather_hourly."""
+    folder = Path(silver_root) / table / "current"
+    return sorted(path.stem for path in folder.glob("*.json")) if folder.is_dir() else []
+
+
+def read_ready_tables(spark: SparkSession, silver_root: Path, table: str) -> tuple[DataFrame, dict]:
+    """Read every published key of a table and union them.
+
+    Returns the DataFrame and {key: pointer} for the manifest. Fails if no key is published.
+    """
+    keys = published_keys(silver_root, table)
+    if not keys:
+        raise ValueError(f"No published keys for {table} under {silver_root}")
+    frames = [read_ready_table(spark, silver_root, table, pointer_key=key) for key in keys]
+    pointers = {
+        key: json.loads(current_pointer(silver_root, table, key).read_text(encoding="utf-8")) for key in keys
+    }
+    combined = frames[0]
+    for frame in frames[1:]:
+        combined = combined.unionByName(frame)
+    return combined, pointers
+

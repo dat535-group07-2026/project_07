@@ -72,6 +72,15 @@ def run_weather(
         distinct_hourly_keys = hourly_df.select("station_id", "weather_hour_utc").distinct().count()
         checks["hourly_keys_unique"] = hourly_count == distinct_hourly_keys
 
+        # Verify each station's UTC shift from the data: FM-12 reports must land on
+        # 3-hourly UTC synoptic hours. A few stations (FLL) send no FM-12 reports;
+        # they are listed in the manifest, and their time zone is checked against
+        # BTS instead (scripts/check_airport_time_zones.py).
+        synoptic = weather.synoptic_hour_shares(tables.retained)
+        checks["utc_shift_matches_synoptic_hours"] = bool(synoptic) and all(
+            s["share"] >= weather.SYNOPTIC_HOURS_MIN_SHARE for s in synoptic.values()
+        )
+
         source_asset_summary = ",".join(asset_ids)
         audit_df = common.build_audit_df(
             spark, run_id, weather.RULE_VERSION, source_asset_summary, counts
@@ -113,12 +122,16 @@ def run_weather(
             "inputs": common.input_snapshot(assets, bronze_root),
             "counts": counts,
             "checks": checks,
+            "utc_shift_hours": {s: weather.STATION_UTC_SHIFT_HOURS[s] for s in stations},
+            "fm12_synoptic_hours": synoptic,
+            "stations_without_fm12": sorted(set(stations) - set(synoptic)),
             "spark_version": spark.version,
             "elapsed_seconds": round(time.monotonic() - started, 3),
             "outputs": {
                 name: common.output_summary(path, silver_root) for name, path in paths.items()
             },
         }
+        # One pointer per year (current/<year>.json), so publishing 2026 keeps 2025.
         for table_name in ("weather_observations", "weather_quarantine", "weather_hourly"):
             manifest_path = paths[table_name] / "_READY.json"
             common.publish_ready(
@@ -126,6 +139,7 @@ def run_weather(
                 table_name,
                 manifest_path,
                 report,
+                pointer_key=year,
                 extra_pointer_fields={"year": year, "stations": list(stations)},
             )
         print(json.dumps(report, indent=2))
@@ -249,7 +263,7 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         default=list(weather.STATION_AIRPORTS.keys()),
         choices=list(weather.STATION_AIRPORTS.keys()),
-        help="Station identifiers to process (default: both JFK and LGA).",
+        help="Station identifiers to process (default: every station in the airport reference table).",
     )
 
     flights_parser = subparsers.add_parser("flights", help="Clean one BTS monthly flight file.")

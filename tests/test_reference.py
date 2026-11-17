@@ -26,11 +26,12 @@ class AirportTableTests(unittest.TestCase):
             self.assertIn(code, self.airports)
 
     def test_jfk_and_lga_match_the_values_used_today(self):
-        for station, code in weather.STATION_AIRPORTS.items():
+        expected = {"JFK": "USW00094789", "LGA": "USW00014732"}
+        for code, station in expected.items():
             self.assertEqual(self.airports[code].noaa_station, station)
             self.assertEqual(self.airports[code].time_zone, enrichment.LOCAL_TIME_ZONE)
-        for code, station in ingest_bronze.STATIONS.items():
-            self.assertEqual(self.airports[code].noaa_station, station)
+            self.assertEqual(weather.STATION_AIRPORTS[station], code)
+            self.assertEqual(ingest_bronze.STATIONS[code], station)
 
     def test_thirty_two_airports_have_a_weather_station(self):
         stations = reference.weather_stations()

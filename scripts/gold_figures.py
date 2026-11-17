@@ -72,7 +72,7 @@ def main(argv=None):
         for month in MONTHS:
             frame = common.read_ready_table(spark, flights_cfg.silver_root, 'flights', pointer_key=month)
             flights = frame if flights is None else flights.unionByName(frame)
-        weather = common.read_ready_table(spark, weather_cfg.silver_root, 'weather_hourly')
+        weather, _ = common.read_ready_tables(spark, weather_cfg.silver_root, 'weather_hourly')
         enriched = enrich_flights(flights, weather).persist(StorageLevel.DISK_ONLY)
         enriched.createOrReplaceTempView('enriched')
         # Use the scheduled-hour enrichment here, not the daily minimum visibility in Gold.

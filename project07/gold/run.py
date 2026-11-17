@@ -60,8 +60,9 @@ def run_gold(
             frame = common.read_ready_table(spark, flights_cfg.silver_root, "flights", pointer_key=month)
             flights = frame if flights is None else flights.unionByName(frame)
             inputs[f"flights {month}"] = _pointer(flights_cfg.silver_root, "flights", month)
-        weather_hourly = common.read_ready_table(spark, weather_cfg.silver_root, "weather_hourly")
-        inputs["weather_hourly"] = _pointer(weather_cfg.silver_root, "weather_hourly")
+        # Weather is published per year; read every published year.
+        weather_hourly, inputs["weather_hourly"] = common.read_ready_tables(
+            spark, weather_cfg.silver_root, "weather_hourly")
 
         # 2. Join, and keep the result on disk so it is not recomputed for each step.
         enriched = enrich_flights(flights, weather_hourly).persist(StorageLevel.DISK_ONLY)
