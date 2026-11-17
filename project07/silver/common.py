@@ -302,6 +302,30 @@ def current_pointer(silver_root: Path, table: str, key: str | None = None) -> Pa
     return table_dir / "current" / f"{key}.json"
 
 
+def read_pointer(root: Path, table: str, key: str | None = None) -> dict | None:
+    """The published pointer of a table (or of one key of it), or None if nothing is published."""
+    path = current_pointer(root, table, key)
+    return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+
+
+def read_manifest(root: Path, table: str, key: str | None = None) -> dict | None:
+    """The _READY.json of the published run of a table (or key), or None if nothing is published."""
+    pointer = read_pointer(root, table, key)
+    if pointer is None:
+        return None
+    table_dir = (Path(root) / table).resolve()
+    path = (table_dir / pointer["ready_manifest"]).resolve()
+    if not path.is_relative_to(table_dir) or not path.is_file():
+        raise ValueError(f"Missing or invalid _READY.json manifest: {path}")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def previous_month(month: str) -> str:
+    """The month before a YYYY-MM month, e.g. 2025-01 -> 2024-12."""
+    year, number = map(int, month.split("-"))
+    return f"{year - (number == 1):04d}-{(number - 2) % 12 + 1:02d}"
+
+
 def input_snapshot(assets: Sequence[SelectedAsset], bronze_root: Path) -> list[dict]:
     """Serialize selected Bronze assets and relative file paths for _READY.json manifests."""
     root = Path(bronze_root).resolve()
@@ -398,4 +422,28 @@ def read_ready_table(
         raise ValueError(f"Missing or invalid _READY.json manifest: {manifest_path}")
     run_dir = manifest_path.parent
     return spark.read.parquet(str(run_dir))
+
+
+def published_keys(silver_root: Path, table: str) -> list[str]:
+    """The keys of a table's per-key pointers, e.g. the years of weather_hourly."""
+    folder = Path(silver_root) / table / "current"
+    return sorted(path.stem for path in folder.glob("*.json")) if folder.is_dir() else []
+
+
+def read_ready_tables(spark: SparkSession, silver_root: Path, table: str) -> tuple[DataFrame, dict]:
+    """Read every published key of a table and union them.
+
+    Returns the DataFrame and {key: pointer} for the manifest. Fails if no key is published.
+    """
+    keys = published_keys(silver_root, table)
+    if not keys:
+        raise ValueError(f"No published keys for {table} under {silver_root}")
+    frames = [read_ready_table(spark, silver_root, table, pointer_key=key) for key in keys]
+    pointers = {
+        key: json.loads(current_pointer(silver_root, table, key).read_text(encoding="utf-8")) for key in keys
+    }
+    combined = frames[0]
+    for frame in frames[1:]:
+        combined = combined.unionByName(frame)
+    return combined, pointers
 

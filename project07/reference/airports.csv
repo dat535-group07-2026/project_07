@@ -1,0 +1,140 @@
+# Airport reference table for project07.
+#
+# One row per airport: the departure airports JFK and LGA, and every airport that
+# had a BTS flight to or from JFK or LGA in January 2025 - August 2026 (counted
+# from the raw Bronze BTS files, 113 airports in total). The last 11 rows were
+# added after the backfill; they are seasonal routes, plus DJT, which is the new
+# BTS code for West Palm Beach (PBI) from August 2026. DJT has no NOAA station of
+# its own here, because PBI's station is already listed under PBI.
+#
+# Columns:
+#   airport       BTS/IATA code, as in the BTS Origin and Dest columns.
+#   city          BTS OriginCityName, only to make the table easy to review.
+#   time_zone     IANA time zone of the airport. Used to convert BTS local clock
+#                 times to UTC and to get each NOAA station's standard-time offset.
+#   noaa_station  NOAA LCD v2 station for weather, only for JFK, LGA and the 30
+#                 airports with the most completed flights to JFK/LGA with a tail
+#                 number in June-October 2025. Empty for the others.
+#
+# Sources and checks (17 November 2026):
+#   - Airports and cities: BTS On-Time Performance, June-October 2025 (Bronze).
+#   - Time zones: IANA tz database. Checked against the BTS data itself with
+#     scripts/check_airport_time_zones.py (scheduled departure, arrival and
+#     elapsed time of each flight to JFK/LGA give the origin's UTC offset).
+#   - NOAA stations: each ID was checked against the NAME, LATITUDE and LONGITUDE
+#     in the first row of its NOAA LCD v2 2025 file. Puerto Rico uses the RQW
+#     prefix instead of USW.
+airport,city,time_zone,noaa_station
+JFK,"New York, NY",America/New_York,USW00094789
+LGA,"New York, NY",America/New_York,USW00014732
+ORD,"Chicago, IL",America/Chicago,USW00094846
+BOS,"Boston, MA",America/New_York,USW00014739
+ATL,"Atlanta, GA",America/New_York,USW00013874
+LAX,"Los Angeles, CA",America/Los_Angeles,USW00023174
+MIA,"Miami, FL",America/New_York,USW00012839
+MCO,"Orlando, FL",America/New_York,USW00012815
+DFW,"Dallas/Fort Worth, TX",America/Chicago,USW00003927
+DCA,"Washington, DC",America/New_York,USW00013743
+FLL,"Fort Lauderdale, FL",America/New_York,USW00012849
+SFO,"San Francisco, CA",America/Los_Angeles,USW00023234
+CLT,"Charlotte, NC",America/New_York,USW00013881
+DEN,"Denver, CO",America/Denver,USW00003017
+DTW,"Detroit, MI",America/Detroit,USW00094847
+RDU,"Raleigh/Durham, NC",America/New_York,USW00013722
+BNA,"Nashville, TN",America/Chicago,USW00013897
+PIT,"Pittsburgh, PA",America/New_York,USW00094823
+TPA,"Tampa, FL",America/New_York,USW00012842
+CMH,"Columbus, OH",America/New_York,USW00014821
+IAH,"Houston, TX",America/Chicago,USW00012960
+PBI,"West Palm Beach/Palm Beach, FL",America/New_York,USW00012844
+LAS,"Las Vegas, NV",America/Los_Angeles,USW00023169
+SJU,"San Juan, PR",America/Puerto_Rico,RQW00011641
+IND,"Indianapolis, IN",America/Indiana/Indianapolis,USW00093819
+BUF,"Buffalo, NY",America/New_York,USW00014733
+SEA,"Seattle, WA",America/Los_Angeles,USW00024233
+MSP,"Minneapolis, MN",America/Chicago,USW00014922
+STL,"St. Louis, MO",America/Chicago,USW00013994
+MSY,"New Orleans, LA",America/Chicago,USW00012916
+ORF,"Norfolk, VA",America/New_York,USW00013737
+PHX,"Phoenix, AZ",America/Phoenix,USW00023183
+CLE,"Cleveland, OH",America/New_York,
+SAN,"San Diego, CA",America/Los_Angeles,
+MDW,"Chicago, IL",America/Chicago,
+RIC,"Richmond, VA",America/New_York,
+AUS,"Austin, TX",America/Chicago,
+CHS,"Charleston, SC",America/New_York,
+GSO,"Greensboro/High Point, NC",America/New_York,
+SLC,"Salt Lake City, UT",America/Denver,
+RSW,"Fort Myers, FL",America/New_York,
+PWM,"Portland, ME",America/New_York,
+MCI,"Kansas City, MO",America/Chicago,
+ACK,"Nantucket, MA",America/New_York,
+CVG,"Cincinnati, OH",America/New_York,
+DAL,"Dallas, TX",America/Chicago,
+JAX,"Jacksonville, FL",America/New_York,
+MVY,"Martha's Vineyard, MA",America/New_York,
+GRR,"Grand Rapids, MI",America/Detroit,
+HOU,"Houston, TX",America/Chicago,
+SDF,"Louisville, KY",America/Kentucky/Louisville,
+SAV,"Savannah, GA",America/New_York,
+PDX,"Portland, OR",America/Los_Angeles,
+MEM,"Memphis, TN",America/Chicago,
+OKC,"Oklahoma City, OK",America/Chicago,
+ROC,"Rochester, NY",America/New_York,
+ILM,"Wilmington, NC",America/New_York,
+IAD,"Washington, DC",America/New_York,
+GSP,"Greer, SC",America/New_York,
+MYR,"Myrtle Beach, SC",America/New_York,
+SRQ,"Sarasota/Bradenton, FL",America/New_York,
+XNA,"Fayetteville, AR",America/Chicago,
+MKE,"Milwaukee, WI",America/Chicago,
+MSN,"Madison, WI",America/Chicago,
+TYS,"Knoxville, TN",America/New_York,
+HNL,"Honolulu, HI",Pacific/Honolulu,
+BQN,"Aguadilla, PR",America/Puerto_Rico,
+BGR,"Bangor, ME",America/New_York,
+CAE,"Columbia, SC",America/New_York,
+AVL,"Asheville, NC",America/New_York,
+TUL,"Tulsa, OK",America/Chicago,
+HYA,"Hyannis, MA",America/New_York,
+STT,"Charlotte Amalie, VI",America/St_Thomas,
+SYR,"Syracuse, NY",America/New_York,
+OMA,"Omaha, NE",America/Chicago,
+SNA,"Santa Ana, CA",America/Los_Angeles,
+BDL,"Hartford, CT",America/New_York,
+PVD,"Providence, RI",America/New_York,
+SAT,"San Antonio, TX",America/Chicago,
+SMF,"Sacramento, CA",America/Los_Angeles,
+BUR,"Burbank, CA",America/Los_Angeles,
+ONT,"Ontario, CA",America/Los_Angeles,
+HHH,"Hilton Head, SC",America/New_York,
+ROA,"Roanoke, VA",America/New_York,
+ABQ,"Albuquerque, NM",America/Denver,
+CHO,"Charlottesville, VA",America/New_York,
+LIT,"Little Rock, AR",America/Chicago,
+DSM,"Des Moines, IA",America/Chicago,
+BZN,"Bozeman, MT",America/Denver,
+PSE,"Ponce, PR",America/Puerto_Rico,
+RNO,"Reno, NV",America/Los_Angeles,
+MHT,"Manchester, NH",America/New_York,
+ANC,"Anchorage, AK",America/Anchorage,
+DAY,"Dayton, OH",America/New_York,
+TVC,"Traverse City, MI",America/Detroit,
+ORH,"Worcester, MA",America/New_York,
+BTV,"Burlington, VT",America/New_York,
+FCA,"Kalispell, MT",America/Denver,
+SBN,"South Bend, IN",America/Indiana/Indianapolis,
+PSP,"Palm Springs, CA",America/Los_Angeles,
+PHL,"Philadelphia, PA",America/New_York,
+EYW,"Key West, FL",America/New_York,
+AGS,"Augusta, GA",America/New_York,
+DAB,"Daytona Beach, FL",America/New_York,
+DJT,"West Palm Beach/Palm Beach, FL",America/New_York,
+EGE,"Eagle, CO",America/Denver,
+GRB,"Green Bay, WI",America/Chicago,
+JAC,"Jackson, WY",America/Denver,
+LEX,"Lexington, KY",America/New_York,
+PNS,"Pensacola, FL",America/Chicago,
+SJC,"San Jose, CA",America/Los_Angeles,
+VPS,"Valparaiso, FL",America/Chicago,
+VRB,"Vero Beach, FL",America/New_York,

@@ -97,6 +97,23 @@ class SparkEnvTests(unittest.TestCase):
             spark_mod.check_spark_env()
 
 
+class SmallHelperTests(unittest.TestCase):
+    def test_previous_month(self):
+        self.assertEqual(common.previous_month("2025-07"), "2025-06")
+        self.assertEqual(common.previous_month("2025-01"), "2024-12")
+
+    def test_read_pointer_and_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.assertIsNone(common.read_pointer(root, "flights", "2025-06"))
+            self.assertIsNone(common.read_manifest(root, "flights", "2025-06"))
+            manifest = root / "flights" / "runs" / "r1" / "_READY.json"
+            common.publish_ready(root, "flights", manifest, {"run_id": "r1", "rule_version": "v"},
+                                 pointer_key="2025-06")
+            self.assertEqual(common.read_pointer(root, "flights", "2025-06")["run_id"], "r1")
+            self.assertEqual(common.read_manifest(root, "flights", "2025-06")["rule_version"], "v")
+
+
 class CatalogAndPublicationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()

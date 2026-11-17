@@ -98,6 +98,19 @@ class FlightSparkTests(unittest.TestCase):
             fixture("negative-duration", 32, AirTime="-10.00", TaxiOut="120.00"),
             fixture("clip-mismatch", 33, DepDelayMinutes="0.00"),
             fixture("negative-clipped", 34, DepTime="0955", DepDelay="-5.00", DepDelayMinutes="-5.00"),
+            fixture("late-with-causes", 35, ArrTime="1230", ArrDelay="30.00", ArrDelayMinutes="30.00",
+                    CarrierDelay="10.00", WeatherDelay="0.00", NASDelay="20.00",
+                    SecurityDelay="0.00", LateAircraftDelay="0.00"),
+            fixture("causes-wrong-sum", 36, ArrTime="1230", ArrDelay="30.00", ArrDelayMinutes="30.00",
+                    CarrierDelay="10.00", WeatherDelay="0.00", NASDelay="15.00",
+                    SecurityDelay="0.00", LateAircraftDelay="0.00"),
+            fixture("causes-partial", 37, CarrierDelay="5.00"),
+            fixture("cause-negative", 38, ArrTime="1230", ArrDelay="30.00", ArrDelayMinutes="30.00",
+                    CarrierDelay="40.00", WeatherDelay="-10.00", NASDelay="0.00",
+                    SecurityDelay="0.00", LateAircraftDelay="0.00"),
+            fixture("cause-unparseable", 39, ArrTime="1230", ArrDelay="30.00", ArrDelayMinutes="30.00",
+                    CarrierDelay="ten", WeatherDelay="0.00", NASDelay="20.00",
+                    SecurityDelay="0.00", LateAircraftDelay="0.00"),
         ]
         rows.extend([dict(rows[16]), dict(rows[17])])
         cls.fixture_rows = rows
@@ -223,11 +236,31 @@ class FlightSparkTests(unittest.TestCase):
             self.outcome(label, warnings=[code])
 
     def test_minute_domain_violations_are_flagged_but_retained(self):
-        for label in ("negative-duration", "clip-mismatch", "negative-clipped"):
+        for label in ("negative-duration", "clip-mismatch", "negative-clipped", "cause-negative"):
             self.outcome(label, warnings=["F_MINUTE_DOMAIN"])
         # A valid early departure clips to zero and is not flagged.
         self.assertEqual(self.outcome("negative").dep_delay_nonnegative_min, 0)
-        self.assertEqual(self.counts["F_MINUTE_DOMAIN"], 3)
+        self.assertEqual(self.counts["F_MINUTE_DOMAIN"], 4)
+
+    def test_delay_causes_are_parsed_and_add_up(self):
+        row = self.outcome("late-with-causes")
+        self.assertEqual(
+            [row[c] for c in flights.DELAY_CAUSES], [10, 0, 20, 0, 0])
+        self.assertEqual(sum(row[c] for c in flights.DELAY_CAUSES), row.arr_delay_nonnegative_min)
+
+    def test_blank_delay_causes_stay_null_without_a_flag(self):
+        row = self.outcome("normal")
+        self.assertEqual([row[c] for c in flights.DELAY_CAUSES], [None] * 5)
+
+    def test_delay_causes_that_do_not_add_up_or_are_partly_filled_are_flagged(self):
+        self.outcome("causes-wrong-sum", warnings=["F_DELAY_CAUSE_MISMATCH"])
+        row = self.outcome("causes-partial", warnings=["F_DELAY_CAUSE_MISMATCH"])
+        self.assertEqual(row.carrier_delay_min, 5)
+        self.assertIsNone(row.weather_delay_min)
+
+    def test_unparseable_delay_cause_is_flagged_once(self):
+        row = self.outcome("cause-unparseable", warnings=["F_NUMERIC_UNPARSEABLE"])
+        self.assertIsNone(row.carrier_delay_min)
 
     def test_malformed_record_and_trailing_field(self):
         row = self.outcome("malformed", ["F_MALFORMED_RECORD"])

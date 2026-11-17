@@ -50,6 +50,8 @@ should validate tokens explicitly and not rely on silent casts to null.
 ## D2. Bronze schedule paused
 
 Status: agreed. Implemented in pull request #1, merged on 22 October 2026.
+Superseded by D15 for the Bronze-to-Gold workflow, which now runs monthly with
+a bounded `--since`. `bronze-ingestion.yml` stays manual-only.
 
 - The monthly cron is commented out in `.github/workflows/bronze-ingestion.yml`.
   The workflow runs only when dispatched manually.
@@ -61,7 +63,9 @@ Status: agreed. Implemented in pull request #1, merged on 22 October 2026.
 
 ## D3. Evaluation window: June to October 2025
 
-Status: agreed by both.
+Status: agreed by both. Superseded by D10 (January 2025 to August 2026). The
+known limitation below is fixed for JFK/LGA departures by `actual_dep_utc` in
+`departures_enriched` (D13).
 
 | Input | Catalog assets | Rows | Raw CSV bytes |
 | --- | --- | --- | --- |
@@ -100,7 +104,9 @@ Status: agreed. Final ownership:
 ## D5. NOAA LCD v2 `DATE` is Local Standard Time (fixed UTC-5)
 
 Status: supported by evidence and agreed by both. Christopher built the weather
-Silver on it.
+Silver on it. Extended by D11: every station uses its own standard-time offset
+(UTC-5 is the New York case), and the FM-12 evidence below is now a check on
+every weather run.
 
 Evidence:
 
@@ -186,7 +192,8 @@ Status: agreed. Implemented on 22 October 2026.
 ## D8. Measured NOAA gaps and the Gold precipitation field
 
 Status: measured on 8 November 2026 from the 2025 LCD v2 files and the first
-Gold dev run (`20261108T174718Z-fa21d594`).
+Gold dev run (`20261108T174718Z-fa21d594`). See D14 for how the longer period
+handles the missing dry hours.
 
 | Check, JFK and LGA | Result |
 | --- | --- |
@@ -293,3 +300,173 @@ each produced one file with 306 rows, covering 102,640 flights and 99,591
 weather matches. All checks passed. These single runs support keeping eight
 partitions on our VM, but do not establish a repeatable full-run speed-up.
 Weather cleaning was not measured.
+
+## D10. Extended window: January 2025 to August 2026
+
+Status: agreed by both on 17 November 2026, after the presentation feedback
+(the project was "thin" and did not use 2026 data). Implemented on the
+`feature/extension` branch and backfilled in dev on 17 November 2026.
+
+| Input | Catalog assets | Rows |
+| --- | --- | --- |
+| BTS flights | `bts:2025-01` to `bts:2026-08` (20 months) | 11,730,351 |
+| NOAA weather | 32 stations, 2025 and 2026 (64 files) | 780,471 |
+
+- August 2026 was the newest BTS month on 17 November 2026; September 2026 was
+  not released yet.
+- The 2026 NOAA files run to mid-November 2026 and keep growing; Bronze
+  refreshes them when a new flight month is downloaded.
+- All 20 flight months passed every Silver check with 0 quarantined rows.
+  `F_CLOCK_DELAY_MISMATCH` (69 in total) is concentrated in 2025-03 (16),
+  2025-11 (8) and 2026-03 (42): the clock-change limitation in D3, now visible
+  because the window includes clock changes.
+- Regression: the extension was checked against the earlier June-October 2025
+  output. Silver weather for JFK/LGA (17,283 hourly rows) is identical row by
+  row. Gold `daily_airport` for June-October 2025 (306 rows, 102,640 flights,
+  99,591 with weather) is identical to the earlier dev run, and equal to the
+  earlier prod run to 9 decimal places (averages differ only in the last
+  floating-point digit because Spark adds the rows in a different order).
+
+## D11. Airport reference table and per-station UTC offsets
+
+Status: implemented and checked on 17 November 2026.
+
+- `project07/reference/airports.csv` lists 113 airports: JFK, LGA and every
+  airport with a BTS flight to or from them in January 2025 to August 2026.
+  Each has an IANA time zone. JFK, LGA and the 30 airports with the most
+  completed inbound flights (June-October 2025) also have a NOAA LCD v2
+  station, 32 in total.
+- Station IDs were checked against the NAME, latitude and longitude in the
+  first row of each station's NOAA file. Puerto Rico uses the `RQW` prefix
+  (San Juan is `RQW00011641`).
+- Time zones were checked against BTS itself with
+  `scripts/check_airport_time_zones.py`: for each flight to or from JFK/LGA,
+  departure clock minus arrival clock plus scheduled elapsed time plus the New
+  York offset gives the other airport's UTC offset. Over 20 months, all 111
+  airports agree on at least 99.6% of 794,207 flights. Winter months are needed
+  to tell Phoenix (no daylight saving) from Los Angeles.
+- NOAA `DATE` is each station's own local standard time. Silver weather adds
+  the station's standard offset (from its time zone in January): 5 hours for
+  New York, 6 for Chicago, 7 for Denver and Phoenix, 8 for Los Angeles, 4 for
+  San Juan.
+- Every weather run checks this offset from the data: FM-12 (SYNOP) reports
+  are sent at 00, 03, ..., 21 UTC, so after conversion at least 95% of each
+  station's FM-12 reports must land on those hours, or the run fails. 2025:
+  99.82-99.89% for the 31 stations with FM-12 reports. Fort Lauderdale (FLL)
+  sends none; it is listed in the manifest and relies on the BTS check above.
+- DJT is BTS's new code for West Palm Beach from August 2026. It has a time
+  zone but no station, because the station is listed under PBI.
+
+## D12. Weather for many stations and years
+
+Status: implemented on 17 November 2026. Rule version `weather-0.2`.
+
+- Weather is published with one pointer per year (`current/2025.json`,
+  `current/2026.json`), as flights are per month. Readers union every
+  published year.
+- The hourly row is the FM-15 report closest to the station's usual report
+  minute: the most common FM-15 minute in that station's year (ties: the lower
+  minute). It is 51 at JFK and LGA and 51-56 elsewhere, so the old fixed 51
+  would pick the wrong report at most stations. `usual_report_minute` is
+  stored with each row.
+- New column `thunderstorm`: true when `HourlyPresentWeatherType` contains
+  `TS` (including `VCTS` and `TSRA`). An empty field means no weather was
+  reported.
+- 2025: 425,669 rows read, 413,477 kept, 12,064 SOD/SOM summaries out of scope,
+  128 quarantined (daylight-saving label conflicts), 276,347 hourly rows.
+- 2026: 354,802 rows read, 344,380 kept, 10,167 out of scope, 255 quarantined,
+  233,634 hourly rows. The 255 rows are a report type NOAA started using on 15 April 2026,
+  `FM94_1`, about 8 per station. Unknown report types are quarantined by
+  design (`W_KEY_INVALID`); the hourly table uses FM-15 only, so results are
+  not affected.
+
+## D13. Chaining: `departures_enriched`
+
+Status: implemented on 17 November 2026. Rule version `departures-0.1`.
+
+`departures_enriched` is a Silver table, published per month. It has one row
+per JFK/LGA departure with:
+
+- the local weather for the scheduled UTC hour (the join that Gold used to run
+  itself, now stored), and `actual_dep_utc` = scheduled UTC time + delay;
+- the inbound flight of the same plane (`inbound_*` columns),
+  `scheduled_ground_min` and `link_status`;
+- the weather at the inbound flight's origin in the hour it was due to leave
+  (`origin_*` columns and `origin_has_station`).
+
+Link rule:
+
+- Only departures that were not cancelled get a link. A cancelled departure did
+  not use the plane; its replacement flight should get the inbound flight.
+- Same tail number, and the inbound flight landed at the airport the departure
+  leaves from. It was not cancelled or diverted.
+- It was due to arrive before the departure's scheduled time, at most 12 hours
+  earlier, and after the plane's previous non-cancelled departure from that
+  airport. If several fit, the latest one wins; ties are broken by
+  `record_hash`.
+- Times are compared in UTC. The inbound scheduled arrival is its scheduled
+  departure in UTC (origin time zone from D11) plus its scheduled elapsed
+  minutes, so overnight and cross-time-zone flights need no date guessing.
+- Linking uses scheduled times on purpose. Linking on actual times would choose
+  links based on the delays being studied.
+- Each run reads the month before as well, so a plane that arrived the evening
+  before the first of the month is found. January 2025 has no previous month
+  in Bronze.
+
+Checks before publishing: every JFK/LGA departure appears once, every inbound
+flight is used at most once, every inbound airport is in the reference table,
+and the read-back count matches. The "used at most once" check stopped the first
+real run (July 2025): 175 inbound flights were claimed by both a cancelled
+departure and its replacement. That led to the first rule above.
+
+Results, 20 months: 397,146 departures; 325,198 linked (85.1% of the 382,173
+departures that were not cancelled); 14,973 cancelled; 56,975 with no inbound
+found (for example the first flight of the day, or a plane arriving from abroad,
+which BTS does not cover); 0 without a tail number. 76.4% of linked inbound
+flights came from an airport with a station. In 29 linked pairs (0.009%) the
+inbound plane actually landed after the departure actually left, and 271 have a
+scheduled ground time of 0 minutes; these are kept and reported, not removed.
+
+## D14. Rain completeness over the longer window
+
+Status: decided on 17 November 2026.
+
+- From 27 August 2025 NOAA leaves dry hours blank instead of writing 0.00
+  (D8). Wet and trace hours are still reported, so blank hours on days with a
+  report in every hour are almost certainly dry.
+- The rain figure therefore uses days with a weather report in all 24 hours and
+  counts blank rain hours as dry. Days where every hour had an amount or a
+  trace are shown separately. This is an assumption and is stated next to
+  every result.
+- January 2025 to August 2026: r = 0.37 on 459 fully reported airport-days,
+  and r = 0.38 on 1,123 airport-days with all 24 weather hours (blank = dry).
+  The summer-2025-only value in D8 was 0.44 on 168 days.
+- `departure_chain` treats blank rain hours the same way: "bad" weather is a
+  thunderstorm, visibility under 5 km, or a measurable amount of rain.
+- `daily_airport` itself is unchanged: `reported_precipitation_mm` still sums
+  only reported amounts.
+
+## D15. Gold tables, monthly automation and checks
+
+Status: implemented on 17 November 2026. Replaces the weekly verify run on the
+`bronze-to-gold.yml` schedule.
+
+- Gold reads `departures_enriched` and publishes three tables, each with its
+  own pointer and read-back check: `daily_airport` (as before), `airport_hour`
+  (flights, delays and weather per airport and hour) and `departure_chain`
+  (linked departures by inbound delay band and good/bad/unknown weather at both
+  ends; counts and sums only). Each table's flight count must match Silver, and
+  `departure_chain` must match the linked departures.
+- Gold uses every published month (or `--start`/`--end`), reads every published
+  weather year, fails if any month has under 80% of flights matched to weather
+  (the lowest real months are about 92%), and stops if the months were built
+  with different rule versions.
+- `scripts/gold_figures.py` reads only the Gold tables and prints every number
+  it draws.
+- `bronze-to-gold.yml` runs on the 5th of each month in Bronze `new` mode from
+  2025-01. `scripts/plan_pipeline_run.py` then decides what to run by comparing
+  published manifests with their inputs: Silver flights and weather against the
+  Bronze file hashes and rule versions, departures against the flights and
+  weather runs they were built from, and Gold against the Silver runs it read.
+  A second run right after the first does nothing. Manual dispatch keeps
+  `new`, `verify` and `manual`. There is still no pull-request trigger (D7).

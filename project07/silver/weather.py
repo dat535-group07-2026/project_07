@@ -1,29 +1,43 @@
-"""NOAA Local Climatological Data (LCD v2) Silver cleaner for JFK and LaGuardia.
+"""NOAA Local Climatological Data (LCD v2) Silver cleaner for the reference airports.
 
-Units in NOAA LCD v2 bulk CSVs are already metric (degrees Celsius, millimetres,
-metres per second, kilometres, whole degrees). Timestamps in the bulk CSV `DATE`
-column are recorded in Local Standard Time (fixed UTC-5 year-round without DST
-shifts, per decision D5) and are converted to UTC via `DATE + INTERVAL 5 HOURS`.
+The stations come from project07/reference/airports.csv (JFK, LGA and the main
+airports that send planes to them). Units in NOAA LCD v2 bulk CSVs are already
+metric (degrees Celsius, millimetres, metres per second, kilometres, whole
+degrees). Timestamps in the bulk CSV `DATE` column are in each station's local
+standard time all year, without daylight saving (decision D5 verified this for
+JFK). They are converted to UTC by adding the station's own standard-time shift,
+for example 5 hours for New York and 6 for Chicago.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import chain
 from pathlib import Path
 from typing import TYPE_CHECKING, Sequence
 
+from project07 import reference
 from project07.silver import common
 
 if TYPE_CHECKING:
     from pyspark.sql import DataFrame, SparkSession
 
-RULE_VERSION = "weather-0.1"
+RULE_VERSION = "weather-0.2"
 PROVENANCE = common.PROVENANCE
 
+_AIRPORTS = reference.load_airports()
+# NOAA station ID -> airport code, for every airport with weather in the reference table.
 STATION_AIRPORTS: dict[str, str] = {
-    "USW00094789": "JFK",
-    "USW00014732": "LGA",
+    a.noaa_station: a.code for a in _AIRPORTS.values() if a.noaa_station
 }
+# Hours to add to a station's local standard time to get UTC (5 for New York).
+STATION_UTC_SHIFT_HOURS: dict[str, int] = {
+    station: -reference.standard_offset_hours(_AIRPORTS[code].time_zone)
+    for station, code in STATION_AIRPORTS.items()
+}
+# FM-12 (SYNOP) reports are sent at fixed UTC hours: 00, 03, ..., 21, minute 00.
+# If a station's UTC shift is right, its FM-12 reports land on those hours.
+SYNOPTIC_HOURS_MIN_SHARE = 0.95
 OBSERVATION_REPORT_TYPES: tuple[str, ...] = ("FM-15", "FM-16", "FM-12")
 SUMMARY_REPORT_TYPES: tuple[str, ...] = ("SOD", "SOM")
 ALL_REPORT_TYPES: tuple[str, ...] = (*OBSERVATION_REPORT_TYPES, *SUMMARY_REPORT_TYPES)
@@ -96,7 +110,7 @@ RULES: dict[str, tuple[str, str]] = {
     "W_KEY_MISSING": ("fatal", "Blank station, timestamp or report type"),
     "W_KEY_INVALID": (
         "fatal",
-        "Station outside JFK/LGA scope, invalid ISO timestamp or unknown report type",
+        "Station not in the airport reference table, invalid ISO timestamp or unknown report type",
     ),
     "W_DST_LABEL_CONFLICT": (
         "fatal",
@@ -154,6 +168,13 @@ def _token(name: str):
 
     trimmed = F.trim(F.col(name))
     return F.when(F.length(trimmed) > 0, trimmed)
+
+
+def _lookup(mapping: dict):
+    """A Spark map literal, used as lookup[column] to translate values."""
+    from pyspark.sql import functions as F
+
+    return F.create_map(*[F.lit(value) for value in chain.from_iterable(mapping.items())])
 
 
 def _numeric_part(token, pattern: str = r"^([+-]?[0-9]+(?:\.[0-9]+)?)[sV]*$"):
@@ -248,18 +269,14 @@ def clean_weather(raw: DataFrame) -> WeatherTables:
 
     frame = (
         frame.withColumn("station_id", station_tok)
-        .withColumn(
-            "airport_code",
-            F.when(station_tok == "USW00094789", F.lit("JFK")).when(
-                station_tok == "USW00014732", F.lit("LGA")
-            ),
-        )
+        .withColumn("airport_code", _lookup(STATION_AIRPORTS)[station_tok])
+        .withColumn("_utc_shift_hours", _lookup(STATION_UTC_SHIFT_HOURS)[station_tok])
         .withColumn("raw_date", date_tok)
         .withColumn("report_type", report_tok)
         .withColumn("source_code", source_tok)
     )
 
-    # Parse ISO timestamp YYYY-MM-DDTHH:MM:SS as TIMESTAMP_NTZ (Local Standard Time, UTC-5).
+    # Parse ISO timestamp YYYY-MM-DDTHH:MM:SS as TIMESTAMP_NTZ (the station's local standard time).
     iso_regex = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}$"
     frame = frame.withColumn(
         "observation_lst",
@@ -268,14 +285,15 @@ def clean_weather(raw: DataFrame) -> WeatherTables:
             F.expr("try_to_timestamp(raw_date, \"yyyy-MM-dd'T'HH:mm:ss\")").cast("timestamp_ntz"),
         ),
     )
-    # Convert Local Standard Time (fixed UTC-5) to UTC instant: observation_lst + 5 hours.
-    # Because spark.sql.session.timeZone=UTC, casting TIMESTAMP_NTZ to TIMESTAMP interprets
-    # the shifted clock components directly as UTC.
+    # Convert local standard time to UTC: observation_lst + the station's shift
+    # (5 hours for New York). Because spark.sql.session.timeZone=UTC, casting
+    # TIMESTAMP_NTZ to TIMESTAMP interprets the shifted clock directly as UTC.
+    # Unknown stations get no shift and no UTC time; they are quarantined below.
     frame = frame.withColumn(
         "observation_utc",
         F.when(
-            F.col("observation_lst").isNotNull(),
-            F.expr(" timestampadd(HOUR, 5, observation_lst) ").cast("timestamp"),
+            F.col("observation_lst").isNotNull() & F.col("_utc_shift_hours").isNotNull(),
+            F.expr("timestampadd(HOUR, _utc_shift_hours, observation_lst)").cast("timestamp"),
         ),
     )
     frame = frame.withColumn(
@@ -320,6 +338,14 @@ def clean_weather(raw: DataFrame) -> WeatherTables:
     frame = frame.withColumn("visibility_km", vis_num.cast("double")).withColumn(
         "visibility_variable",
         F.when(vis_num.isNotNull(), vis_tok.contains("V")),
+    )
+
+    # Present-weather codes, e.g. "TS -RA:02 BR:1 |TS RA BR |RA". "TS" means a
+    # thunderstorm at or near the station (also "VCTS", "TSRA"). An empty field
+    # means no weather phenomena were reported.
+    frame = frame.withColumn(
+        "thunderstorm",
+        F.coalesce(_token("HourlyPresentWeatherType").contains("TS"), F.lit(False)),
     )
 
     # Identify unparseable tokens vs suspect flags vs physical range violations.
@@ -435,6 +461,7 @@ def clean_weather(raw: DataFrame) -> WeatherTables:
             "wind_gust_mps",
             "visibility_km",
             "visibility_variable",
+            "thunderstorm",
             "year",
             "month",
             "quality_flags",
@@ -451,16 +478,27 @@ def build_hourly_weather(retained_observations: DataFrame) -> DataFrame:
     """Build the unique hourly weather table from retained routine (FM-15) observations.
 
     Produces at most one row per (station_id, weather_hour_utc) using a deterministic
-    ordering that prefers the routine :51 observation, then the latest observation in
-    the hour, then source_code descending, then record_hash ascending.
+    ordering that prefers the observation closest to the station's usual report
+    minute (51 at JFK and LGA), then the latest observation in the hour, then
+    source_code descending, then record_hash ascending.
     Partitions by year and month of weather_hour_utc per contract item 9.
     """
     from pyspark.sql import Window, functions as F
 
     fm15 = retained_observations.filter(F.col("report_type") == "FM-15")
+    # Each station sends its routine report at a fixed minute. The usual minute
+    # is the most common FM-15 minute for the station (ties: the lowest minute).
+    minute_counts = fm15.groupBy("station_id", F.minute("observation_utc").alias("usual_report_minute")).count()
+    usual = (
+        minute_counts.withColumn("_r", F.row_number().over(
+            Window.partitionBy("station_id").orderBy(F.desc("count"), F.asc("usual_report_minute"))))
+        .filter(F.col("_r") == 1)
+        .select("station_id", F.col("usual_report_minute").cast("int"))
+    )
+    fm15 = fm15.join(F.broadcast(usual), "station_id")
     hour_window = Window.partitionBy("station_id", "weather_hour_utc")
     rank_window = hour_window.orderBy(
-        F.abs(F.minute("observation_utc") - F.lit(51)).asc(),
+        F.abs(F.minute("observation_utc") - F.col("usual_report_minute")).asc(),
         F.col("observation_utc").desc(),
         F.coalesce(F.col("source_code"), F.lit("")).desc(),
         F.col("record_hash").asc(),
@@ -486,6 +524,7 @@ def build_hourly_weather(retained_observations: DataFrame) -> DataFrame:
         "raw_date",
         "report_type",
         "source_code",
+        "usual_report_minute",
         "fm15_reports_in_hour",
         "temperature_c",
         "precipitation_mm",
@@ -496,9 +535,37 @@ def build_hourly_weather(retained_observations: DataFrame) -> DataFrame:
         "wind_gust_mps",
         "visibility_km",
         "visibility_variable",
+        "thunderstorm",
         "year",
         "month",
         "quality_flags",
         "source_occurrences",
     )
+
+
+def synoptic_hour_shares(retained_observations: DataFrame) -> dict[str, dict]:
+    """Per station: how many FM-12 reports land on a 3-hourly UTC synoptic hour.
+
+    FM-12 (SYNOP) reports are sent at 00, 03, ..., 21 UTC. After the conversion to
+    UTC they must land on those hours (minute 00). If a station's UTC shift were
+    wrong by one or two hours, almost none would. The Silver run fails if a
+    station's share is below SYNOPTIC_HOURS_MIN_SHARE.
+    """
+    from pyspark.sql import functions as F
+
+    on_hour = (F.minute("observation_utc") == 0) & (F.hour("observation_utc") % 3 == 0)
+    rows = (
+        retained_observations.filter(F.col("report_type") == "FM-12")
+        .groupBy("station_id")
+        .agg(F.count("*").alias("fm12_reports"), F.sum(on_hour.cast("int")).alias("on_synoptic_hour"))
+        .collect()
+    )
+    return {
+        row["station_id"]: {
+            "fm12_reports": row["fm12_reports"],
+            "on_synoptic_hour": row["on_synoptic_hour"],
+            "share": round(row["on_synoptic_hour"] / row["fm12_reports"], 4),
+        }
+        for row in rows
+    }
 

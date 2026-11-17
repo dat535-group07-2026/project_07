@@ -11,6 +11,13 @@ from typing import Sequence
 
 from project07 import config as cfg_mod
 
+# The Gold manifest count that holds each table's flight total.
+GOLD_FLIGHT_COUNTS = {
+    "daily_airport": "daily_airport_flights",
+    "airport_hour": "airport_hour_flights",
+    "departure_chain": "departure_chain_departures",
+}
+
 
 def collect_bronze_manifests(
     bronze_root: Path,
@@ -42,9 +49,10 @@ def collect_layer_manifests(
     if not layer_root.is_dir():
         return collected
 
-    pointer_files = sorted(layer_root.glob("*/current.json")) + sorted(
-        layer_root.glob("*/current/*.json")
-    )
+    # A table published per key (current/<month or year>.json) may still have an old
+    # single current.json from before it was split. Skip that old pointer.
+    single = [p for p in sorted(layer_root.glob("*/current.json")) if not (p.parent / "current").is_dir()]
+    pointer_files = single + sorted(layer_root.glob("*/current/*.json"))
     for pointer_path in pointer_files:
         rel_pointer = pointer_path.relative_to(layer_root)
         dest_pointer = out_dir / rel_pointer
@@ -133,10 +141,16 @@ def format_summary(
         counts = manifest.get("counts", {})
         label = f"{pointer['table']}" + (f" ({pointer['key']})" if "key" in pointer else "")
         commit = str(manifest.get("git_commit", ""))[:7]
+        if pointer["table"] == "departures_enriched":
+            # Departures are linked, not cleaned, so they have their own counts.
+            detail = (f"departures={counts.get('departures')}, linked={counts.get('link_linked')}, "
+                      f"cancelled={counts.get('link_cancelled')}, "
+                      f"no_inbound={counts.get('link_no_inbound_found')}")
+        else:
+            detail = (f"raw={counts.get('raw')}, retained={counts.get('retained')}, "
+                      f"quarantined={counts.get('quarantined')}")
         lines.append(
-            f"- `{label}` (`{manifest['run_id']}`, `{commit}`): "
-            f"raw={counts.get('raw')}, retained={counts.get('retained')}, "
-            f"quarantined={counts.get('quarantined')}, "
+            f"- `{label}` (`{manifest['run_id']}`, `{commit}`): {detail}, "
             f"elapsed={manifest.get('elapsed_seconds')}s"
         )
 
@@ -149,9 +163,13 @@ def format_summary(
             continue
         counts = manifest.get("counts", {})
         commit = str(manifest.get("git_commit", ""))[:7]
+        table = pointer["table"]
+        # One Gold run publishes three tables; older runs had only daily_airport.
+        rows = counts.get("rows", {}).get(table, counts.get("gold_rows"))
+        flights = counts.get(GOLD_FLIGHT_COUNTS.get(table, ""), counts.get("gold_flights"))
         lines.append(
-            f"- `{pointer['table']}` (`{manifest['run_id']}`, `{commit}`): "
-            f"rows={counts.get('gold_rows')}, flights={counts.get('gold_flights')}, "
+            f"- `{table}` (`{manifest['run_id']}`, `{commit}`): "
+            f"rows={rows}, flights={flights}, "
             f"with_weather={counts.get('flights_with_weather')}, "
             f"days_without_weather={counts.get('days_without_weather')}, "
             f"elapsed={manifest.get('elapsed_seconds')}s"

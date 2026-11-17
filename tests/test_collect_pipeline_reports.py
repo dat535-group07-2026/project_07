@@ -140,6 +140,46 @@ class CollectPipelineReportsTests(unittest.TestCase):
         self.assertIn("`flights (2025-06)` (`f-1`, `abcdef1`): raw=100, retained=98, quarantined=2", summary)
         self.assertIn("`daily_airport` (`g-1`, `abcdef1`): rows=306, flights=102640, with_weather=99591", summary)
 
+    def test_old_single_pointer_is_skipped_once_a_table_has_per_key_pointers(self) -> None:
+        silver_root = self.data_root / "silver" / "prod"
+        common.publish_ready(silver_root, "weather_hourly",
+                             silver_root / "weather_hourly" / "runs" / "old" / "_READY.json", {"run_id": "old"})
+        common.publish_ready(silver_root, "weather_hourly",
+                             silver_root / "weather_hourly" / "runs" / "new" / "_READY.json", {"run_id": "new"},
+                             pointer_key="2025")
+        entries = collector.collect_layer_manifests(silver_root, self.artifact_dir / "manifests" / "silver")
+        self.assertEqual([rel for rel, _, _ in entries], ["weather_hourly/current/2025.json"])
+
+    def test_summary_shows_departures_and_the_three_gold_tables(self) -> None:
+        silver_root = self.data_root / "silver" / "prod"
+        common.publish_ready(
+            silver_root, "departures_enriched",
+            silver_root / "departures_enriched" / "runs" / "d-1" / "_READY.json",
+            {"run_id": "d-1", "git_commit": "abcdef1234567", "elapsed_seconds": 20.0,
+             "counts": {"departures": 20958, "link_linked": 16182, "link_cancelled": 1601,
+                        "link_no_inbound_found": 3175}},
+            pointer_key="2025-07",
+        )
+        gold_root = self.data_root / "gold" / "prod"
+        report = {"run_id": "g-2", "git_commit": "abcdef1234567", "elapsed_seconds": 30.0,
+                  "counts": {"rows": {"daily_airport": 1216, "airport_hour": 21645, "departure_chain": 15531},
+                             "daily_airport_flights": 397146, "airport_hour_flights": 397146,
+                             "departure_chain_departures": 325198,
+                             "flights_with_weather": 392672, "days_without_weather": 6}}
+        for table in ("daily_airport", "airport_hour", "departure_chain"):
+            common.publish_ready(gold_root, table, gold_root / table / "runs" / "g-2" / "_READY.json", report)
+        silver = collector.collect_layer_manifests(silver_root, self.artifact_dir / "manifests" / "silver")
+        gold = collector.collect_layer_manifests(gold_root, self.artifact_dir / "manifests" / "gold")
+        summary = collector.format_summary(
+            target_env="prod", event_name="workflow_dispatch", operation="new", start_month="2025-01",
+            end_month="latest", weather_year="none", archive_dir=self.archive_dir, bronze_reports=[],
+            silver_entries=silver, gold_entries=gold)
+        self.assertIn("`departures_enriched (2025-07)` (`d-1`, `abcdef1`): departures=20958, linked=16182, "
+                      "cancelled=1601, no_inbound=3175", summary)
+        self.assertIn("`airport_hour` (`g-2`, `abcdef1`): rows=21645, flights=397146", summary)
+        self.assertIn("`departure_chain` (`g-2`, `abcdef1`): rows=15531, flights=325198", summary)
+        self.assertNotIn("None", summary.split("### Gold")[1])
+
     def test_ignores_unsafe_ready_manifest_path_outside_table(self) -> None:
         outside = self.root / "secret.json"
         outside.write_text('{"secret": true}', encoding="utf-8")

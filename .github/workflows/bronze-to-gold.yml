@@ -1,28 +1,30 @@
 name: Bronze to Gold pipeline
 
+# Monthly: fetch newly released BTS months and the growing NOAA year files, then
+# re-run only the Silver and Gold steps whose inputs changed. Which months and
+# years to run is decided by scripts/plan_pipeline_run.py, which compares what is
+# published with its inputs, so a second run right after the first does nothing.
+
 on:
   workflow_dispatch:
     inputs:
       bronze_operation:
-        description: Verify existing Bronze files, download a range, or run bounded new-release check
+        description: Verify existing Bronze files, download a range, or check for new releases
         type: choice
-        options: [verify, manual, new]
-        default: verify
+        options: [new, verify, manual]
+        default: new
       start_month:
-        description: First month to process (YYYY-MM)
+        description: First month (YYYY-MM). Also the first month kept up to date in Silver and Gold.
         type: string
-        default: '2025-06'
+        default: '2025-01'
       end_month:
-        description: Last month to process (YYYY-MM)
+        description: Last month (YYYY-MM). Required for verify and manual; empty means the previous calendar month for new.
         type: string
-        default: '2025-10'
-      weather_year:
-        description: NOAA LCD v2 station year (YYYY)
-        type: string
-        default: '2025'
+        default: ''
   schedule:
-    # Weekly bounded verification and Bronze-to-Gold run on Sundays at 06:17 UTC.
-    - cron: '17 6 * * 0'
+    # Monthly on the 5th at 06:17 UTC. BTS releases months with a delay; months that
+    # are not out yet are recorded as pending by Bronze and tried again next month.
+    - cron: '17 6 5 * *'
 
 permissions:
   contents: read
@@ -34,15 +36,14 @@ concurrency:
 jobs:
   pipeline:
     runs-on: [self-hosted, Linux, X64, project-07]
-    timeout-minutes: 120
+    timeout-minutes: 240
     env:
       DATA_ROOT: /home/ubuntu/project-data
       TARGET_ENV: prod
       JAVA_HOME: /usr/lib/jvm/java-8-openjdk-amd64
-      OPERATION: ${{ github.event_name == 'schedule' && 'verify' || inputs.bronze_operation || 'verify' }}
-      START_MONTH: ${{ inputs.start_month || '2025-06' }}
-      END_MONTH: ${{ inputs.end_month || '2025-10' }}
-      WEATHER_YEAR: ${{ inputs.weather_year || '2025' }}
+      OPERATION: ${{ github.event_name == 'schedule' && 'new' || inputs.bronze_operation || 'new' }}
+      START_MONTH: ${{ inputs.start_month || '2025-01' }}
+      END_MONTH: ${{ inputs.end_month || '' }}
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -82,14 +83,20 @@ jobs:
           set -euo pipefail
           {
             case "$OPERATION" in
-              verify)
-                "$VENV_PY" scripts/ingest_bronze.py manual --start "$START_MONTH" --end "$END_MONTH" --data-root "$DATA_ROOT" --offline
-                ;;
-              manual)
-                "$VENV_PY" scripts/ingest_bronze.py manual --start "$START_MONTH" --end "$END_MONTH" --data-root "$DATA_ROOT"
+              verify|manual)
+                if [ -z "$END_MONTH" ]; then
+                  printf 'end_month is required for %s\n' "$OPERATION" >&2
+                  exit 1
+                fi
+                OFFLINE=""
+                if [ "$OPERATION" = verify ]; then OFFLINE="--offline"; fi
+                "$VENV_PY" scripts/ingest_bronze.py manual --start "$START_MONTH" --end "$END_MONTH" \
+                  --data-root "$DATA_ROOT" $OFFLINE
                 ;;
               new)
-                "$VENV_PY" scripts/ingest_bronze.py new --since "$START_MONTH" --through "$END_MONTH" --data-root "$DATA_ROOT"
+                THROUGH=""
+                if [ -n "$END_MONTH" ]; then THROUGH="--through $END_MONTH"; fi
+                "$VENV_PY" scripts/ingest_bronze.py new --since "$START_MONTH" $THROUGH --data-root "$DATA_ROOT"
                 ;;
               *)
                 printf 'Unknown operation: %s\n' "$OPERATION" >&2
@@ -98,37 +105,54 @@ jobs:
             esac
           } 2>&1 | tee "$ARTIFACT_DIR/logs/01-bronze.log"
 
-      - name: Run Silver weather
+      - name: Run Silver flights for new or changed months
         shell: bash
         run: |
           set -euo pipefail
           unset PYSPARK_DRIVER_PYTHON PYSPARK_DRIVER_PYTHON_OPTS
-          "$VENV_PY" -m project07.silver.run weather \
-            --env "$TARGET_ENV" \
-            --data-root "$DATA_ROOT" \
-            --year "$WEATHER_YEAR" 2>&1 | tee "$ARTIFACT_DIR/logs/02-silver-weather.log"
-
-      - name: Run Silver flights
-        shell: bash
-        run: |
-          set -euo pipefail
-          unset PYSPARK_DRIVER_PYTHON PYSPARK_DRIVER_PYTHON_OPTS
-          MONTHS="$("$VENV_PY" -c 'import os; from scripts.ingest_bronze import month, month_range; print(" ".join(month_range(month(os.environ["START_MONTH"]), month(os.environ["END_MONTH"]))))')"
+          MONTHS="$("$VENV_PY" -m scripts.plan_pipeline_run flights --env "$TARGET_ENV" --data-root "$DATA_ROOT" --since "$START_MONTH")"
+          echo "Flight months to run: ${MONTHS:-none}" | tee "$ARTIFACT_DIR/logs/02-plan-flights.log"
           for month in $MONTHS; do
-            "$VENV_PY" -m project07.silver.run flights \
-              --env "$TARGET_ENV" \
-              --data-root "$DATA_ROOT" \
-              --month "$month" 2>&1 | tee "$ARTIFACT_DIR/logs/03-silver-flights-${month}.log"
+            "$VENV_PY" -m project07.silver.run flights --env "$TARGET_ENV" --data-root "$DATA_ROOT" \
+              --month "$month" 2>&1 | tee "$ARTIFACT_DIR/logs/02-silver-flights-${month}.log"
           done
 
-      - name: Run Gold daily_airport
+      - name: Run Silver weather for new or changed years
         shell: bash
         run: |
           set -euo pipefail
           unset PYSPARK_DRIVER_PYTHON PYSPARK_DRIVER_PYTHON_OPTS
-          "$VENV_PY" -m project07.gold.run \
-            --env "$TARGET_ENV" \
-            --data-root "$DATA_ROOT" 2>&1 | tee "$ARTIFACT_DIR/logs/04-gold.log"
+          YEARS="$("$VENV_PY" -m scripts.plan_pipeline_run weather --env "$TARGET_ENV" --data-root "$DATA_ROOT" --since "$START_MONTH")"
+          echo "Weather years to run: ${YEARS:-none}" | tee "$ARTIFACT_DIR/logs/03-plan-weather.log"
+          echo "PLANNED_WEATHER_YEARS=${YEARS:-none}" >> "$GITHUB_ENV"
+          for year in $YEARS; do
+            "$VENV_PY" -m project07.silver.run weather --env "$TARGET_ENV" --data-root "$DATA_ROOT" \
+              --year "$year" 2>&1 | tee "$ARTIFACT_DIR/logs/03-silver-weather-${year}.log"
+          done
+
+      - name: Run Silver departures for months whose inputs changed
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset PYSPARK_DRIVER_PYTHON PYSPARK_DRIVER_PYTHON_OPTS
+          MONTHS="$("$VENV_PY" -m scripts.plan_pipeline_run departures --env "$TARGET_ENV" --data-root "$DATA_ROOT" --since "$START_MONTH")"
+          echo "Departure months to run: ${MONTHS:-none}" | tee "$ARTIFACT_DIR/logs/04-plan-departures.log"
+          for month in $MONTHS; do
+            "$VENV_PY" -m project07.silver.run departures --env "$TARGET_ENV" --data-root "$DATA_ROOT" \
+              --month "$month" 2>&1 | tee "$ARTIFACT_DIR/logs/04-silver-departures-${month}.log"
+          done
+
+      - name: Run Gold if any input changed
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset PYSPARK_DRIVER_PYTHON PYSPARK_DRIVER_PYTHON_OPTS
+          NEEDED="$("$VENV_PY" -m scripts.plan_pipeline_run gold --env "$TARGET_ENV" --data-root "$DATA_ROOT" --since "$START_MONTH")"
+          echo "Gold needed: ${NEEDED:-no}" | tee "$ARTIFACT_DIR/logs/05-plan-gold.log"
+          if [ -n "$NEEDED" ]; then
+            "$VENV_PY" -m project07.gold.run --env "$TARGET_ENV" --data-root "$DATA_ROOT" \
+              --start "$START_MONTH" 2>&1 | tee "$ARTIFACT_DIR/logs/05-gold.log"
+          fi
 
       - name: Collect manifests, persist logs, and write summary
         if: always()
@@ -145,8 +169,8 @@ jobs:
             --event-name "$GITHUB_EVENT_NAME" \
             --operation "$OPERATION" \
             --start-month "$START_MONTH" \
-            --end-month "$END_MONTH" \
-            --weather-year "$WEATHER_YEAR"
+            --end-month "${END_MONTH:-latest}" \
+            --weather-year "${PLANNED_WEATHER_YEARS:-none}"
 
       - name: Upload pipeline logs and manifests
         if: always()
