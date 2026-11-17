@@ -6,10 +6,10 @@ need to be running.
 
 ## Existing inputs
 
-Verify and register the June to September 2025 downloads already on the VM:
+Verify the downloads already on the VM (January 2025 to August 2026):
 
 ```sh
-python3 scripts/ingest_bronze.py manual --start 2025-06 --end 2025-09 --offline
+python3 scripts/ingest_bronze.py manual --start 2025-01 --end 2026-08 --offline
 ```
 
 The first run imports the original manifest from
@@ -20,13 +20,15 @@ Each rerun checks file sizes, SHA-256 hashes, CSV headers and BTS ZIP integrity.
 ## Download a month range
 
 ```sh
-python3 scripts/ingest_bronze.py manual --start 2025-06 --end 2025-09
+python3 scripts/ingest_bronze.py manual --start 2025-01 --end 2026-08
 ```
 
 Month ranges are inclusive. Each month downloads the national BTS reporting
 carrier archive, not just flights from JFK and LGA. For every year in the range,
-the script also retrieves the annual NOAA LCD v2 files for JFK (`USW00094789`)
-and LGA (`USW00014732`). Existing verified inputs are reused.
+the script also retrieves the annual NOAA LCD v2 file of every station in the
+airport reference table, `project07/reference/airports.csv` (32 stations: JFK
+`USW00094789`, LGA `USW00014732` and the 30 main airports that send planes to
+them; D11). Existing verified inputs are reused.
 
 Add `--refresh` to check the sources for revisions. Changed content is kept as
 a new version, while previous versions remain available. Without `--refresh`,
@@ -56,18 +58,23 @@ downloads. Network failures, permissions errors and invalid downloads fail the
 run instead of being treated as missing months. When new flights are retrieved,
 the matching annual weather files are refreshed too.
 
-The script itself does not schedule runs. The workflow's monthly schedule is
-currently paused, so `new` runs only when dispatched manually. The first check
-after a long gap can download several months, so preview it before running it.
+The script itself does not schedule runs. The `Bronze to Gold pipeline`
+workflow runs `new --since 2025-01` on the 5th of each month and then runs
+Silver and Gold where inputs changed (D15). The first check after a long gap can
+download several months, so preview it before running it.
 
 ## GitHub Actions
 
-The `Bronze ingestion` workflow runs on the VM's `spark-vm-project07` runner,
-labelled `project-07`. Its monthly schedule (first day of the month, 06:17 UTC)
-is paused while Silver is developed on fixed June-October 2025 inputs. An
-unbounded `new` run would check every month from 2025-11 onward and refresh the
-2025 weather files. Re-enable it only with a bounded `--since`/`--through`
-policy. The workflow does not yet run Silver or Gold.
+Two workflows run on the VM's `spark-vm-project07` runner, labelled `project-07`:
+
+- `Bronze to Gold pipeline` (`bronze-to-gold.yml`) is the scheduled one: monthly
+  on the 5th at 06:17 UTC, Bronze in bounded `new` mode from 2025-01, then only
+  the Silver and Gold steps whose inputs changed. See the README and D15.
+- `Bronze ingestion` (`bronze-ingestion.yml`) is for manual Bronze-only runs. Its
+  own monthly schedule stays paused (D2), because the pipeline workflow above
+  already checks for new months.
+
+The rest of this section describes the manual Bronze-only workflow.
 
 Under GitHub Actions, select **Bronze ingestion**, then **Run workflow**:
 
