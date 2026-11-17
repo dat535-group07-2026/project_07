@@ -37,6 +37,16 @@ def select_months(published: Sequence[str], start: str | None = None, end: str |
     return months
 
 
+def flight_rule_versions(silver_root, months: Sequence[str]) -> dict[str, str]:
+    """Rule version of each published flight month, read from its _READY.json."""
+    versions = {}
+    for month in months:
+        pointer = _pointer(silver_root, "flights", month)
+        manifest = json.loads((silver_root / "flights" / pointer["ready_manifest"]).read_text(encoding="utf-8"))
+        versions[month] = manifest["rule_version"]
+    return versions
+
+
 def weather_coverage_per_month(enriched) -> dict[str, float]:
     """Share of flights per month that matched an hourly weather report."""
     rows = enriched.selectExpr(
@@ -79,6 +89,10 @@ def run_gold(
     try:
         # 1. Read the published inputs through their pointers.
         months = select_months(common.published_keys(flights_cfg.silver_root, "flights"), start, end)
+        # All months must come from the same flight rules, or their columns differ.
+        versions = flight_rule_versions(flights_cfg.silver_root, months)
+        if len(set(versions.values())) > 1:
+            raise ValueError(f"Flight months were cleaned with different rule versions, re-run Silver: {versions}")
         inputs = {}
         flights = None
         for month in months:

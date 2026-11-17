@@ -22,6 +22,23 @@ class MonthSelectionTests(unittest.TestCase):
             run.select_months(self.PUBLISHED, "2024-01", "2024-12")
 
 
+class RuleVersionTests(unittest.TestCase):
+    def test_rule_version_per_month_comes_from_the_manifest(self):
+        import tempfile
+        from pathlib import Path
+
+        from project07.silver import common
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for month, version in (("2025-06", "flights-0.3"), ("2025-07", "flights-0.2")):
+                manifest = root / "flights" / "runs" / month / "_READY.json"
+                common.publish_ready(root, "flights", manifest, {"run_id": month, "rule_version": version},
+                                     pointer_key=month)
+            self.assertEqual(run.flight_rule_versions(root, ["2025-06", "2025-07"]),
+                             {"2025-06": "flights-0.3", "2025-07": "flights-0.2"})
+
+
 class CoverageAndYearBoundaryTests(SparkTestCase):
     FLIGHTS = "flight_date date, origin string, scheduled_dep_local timestamp_ntz, cancelled boolean"
     WEATHER = "airport_code string, weather_hour_utc timestamp, observation_utc timestamp, record_hash string, quality_flags array<string>"
