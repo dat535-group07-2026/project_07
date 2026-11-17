@@ -7,6 +7,8 @@ same plane (same tail number) to that airport, and adds:
   - the weather at the inbound flight's origin in the hour it was due to leave.
 
 The link rule, in plain words:
+  - only departures that were not cancelled get a link: a cancelled departure did
+    not use the plane, and its replacement flight should get the inbound flight;
   - same tail number, and the inbound flight lands at the airport the departure leaves from;
   - the inbound flight was not cancelled or diverted;
   - it was due to arrive before the departure's scheduled time, at most 12 hours earlier;
@@ -36,7 +38,7 @@ ORIGIN_WEATHER_COLUMNS = (
     "observation_utc", "temperature_c", "precipitation_mm", "precipitation_trace",
     "wind_speed_mps", "wind_gust_mps", "visibility_km", "thunderstorm",
 )
-LINK_STATUSES = ("linked", "no_tail_number", "no_inbound_found")
+LINK_STATUSES = ("linked", "cancelled", "no_tail_number", "no_inbound_found")
 
 
 def _time_zones(airports: dict):
@@ -119,7 +121,8 @@ def link_inbound(departures: DataFrame, candidates: DataFrame) -> DataFrame:
 
     d, i = departures.alias("d"), inbound.alias("i")
     condition = (
-        (F.col("d.tail_number") == F.col("i._in_tail"))
+        ~F.col("d.cancelled")
+        & (F.col("d.tail_number") == F.col("i._in_tail"))
         & (F.col("d.origin") == F.col("i._in_dest"))
         & (F.col("i.inbound_scheduled_arr_utc") <= F.col("d.scheduled_dep_utc"))
         & (F.col("i.inbound_scheduled_arr_utc")
@@ -136,7 +139,8 @@ def link_inbound(departures: DataFrame, candidates: DataFrame) -> DataFrame:
         .drop("_rank", "_in_tail", "_in_dest")
     )
     return (
-        linked.withColumn("link_status", F.when(F.col("tail_number").isNull(), "no_tail_number")
+        linked.withColumn("link_status", F.when(F.col("cancelled"), "cancelled")
+                          .when(F.col("tail_number").isNull(), "no_tail_number")
                           .when(F.col("inbound_record_hash").isNotNull(), "linked")
                           .otherwise("no_inbound_found"))
         .withColumn("scheduled_ground_min", F.when(

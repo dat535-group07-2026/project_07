@@ -49,6 +49,10 @@ ROWS = [
     flight("a10", "ORD", "JFK", "T10", "2025-06-01 07:00", elapsed=140),
     flight("d10", "JFK", "ORD", "T10", "2025-06-01 13:00"),
     flight("a11", "XXX", "JFK", "T11", "2025-06-01 07:00"),
+    # A cancelled departure does not use the plane; its replacement gets the inbound flight.
+    flight("a12", "BOS", "JFK", "T12", "2025-06-01 08:00"),
+    flight("d12a", "JFK", "BOS", "T12", "2025-06-01 10:00", cancelled=True),
+    flight("d12b", "JFK", "BOS", "T12", "2025-06-01 11:00"),
 ]
 
 
@@ -137,6 +141,10 @@ class ChainTests(SparkTestCase):
         self.assertEqual(self.rows["d1"].temperature_c, 25.0)
         self.assertFalse(self.rows["d1"].origin_has_station)
         self.assertIsNone(self.rows["d1"].origin_observation_utc)
+
+    def test_cancelled_departure_leaves_the_inbound_for_its_replacement(self):
+        self.assert_no_link("d12a", "cancelled")
+        self.assert_link("d12b", "a12", ground=105)
 
     def test_unknown_inbound_airport_is_reported(self):
         self.assertEqual(chain.unknown_inbound_airports(self.candidates), ["XXX"])
