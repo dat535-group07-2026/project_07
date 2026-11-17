@@ -16,6 +16,7 @@ SILVER_TABLES = (
     "weather_observations",
     "weather_quarantine",
     "weather_hourly",
+    "departures_enriched",
     "audit",
 )
 

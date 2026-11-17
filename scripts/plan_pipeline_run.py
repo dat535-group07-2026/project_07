@@ -31,6 +31,7 @@ from project07.silver import chain, common, flights, weather
 
 LAYERS = ("flights", "weather", "departures", "gold")
 GOLD_TABLE = "daily_airport"
+GOLD_TABLES = ("daily_airport", "airport_hour", "departure_chain")
 
 
 def bronze_versions(bronze_root: Path) -> dict:
@@ -123,6 +124,9 @@ def stale_departure_months(silver_root: Path, since: str) -> list[str]:
 def gold_needed(gold_root: Path, silver_root: Path, since: str) -> bool:
     report = manifest(gold_root, GOLD_TABLE)
     if report is None:
+        return True
+    # One Gold run publishes all three tables. If a run stopped half-way, they differ.
+    if any(_run_id(gold_root, table) != report["run_id"] for table in GOLD_TABLES):
         return True
     months = [m for m in common.published_keys(silver_root, "departures_enriched") if m >= since]
     if report.get("months") != months:

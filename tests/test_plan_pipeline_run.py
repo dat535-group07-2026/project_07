@@ -67,8 +67,10 @@ class PlannerTests(unittest.TestCase):
             for table in ("flights", "departures_enriched"):
                 inputs[f"{table} {month}"] = self.pointers(table, [month])[month]
         self.runs += 1
-        common.publish_ready(self.gold, "daily_airport", self.gold / "daily_airport" / "runs" / "g" / "_READY.json",
-                             {"run_id": f"g{self.runs}", "months": months, "inputs": inputs})
+        run_id = f"g{self.runs}"
+        for table in plan.GOLD_TABLES:
+            common.publish_ready(self.gold, table, self.gold / table / "runs" / run_id / "_READY.json",
+                                 {"run_id": run_id, "months": months, "inputs": inputs})
 
     def run_plan(self, layer):
         return plan.plan(layer, self.bronze, self.silver, self.gold, "2025-01")
@@ -121,6 +123,12 @@ class PlannerTests(unittest.TestCase):
         self.add_noaa("2025", STATIONS[0], "b" * 64)
         self.publish_weather(stations=STATIONS[1:])
         self.assertEqual(self.run_plan("weather"), ["2025"])
+
+    def test_gold_run_that_stopped_half_way_is_rerun(self):
+        self.publish_everything()
+        common.publish_ready(self.gold, "airport_hour", self.gold / "airport_hour" / "runs" / "old" / "_READY.json",
+                             {"run_id": "old"})
+        self.assertEqual(self.run_plan("gold"), ["yes"])
 
     def test_republished_weather_makes_departures_and_gold_stale(self):
         self.publish_everything()
